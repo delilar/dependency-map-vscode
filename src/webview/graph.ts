@@ -11,6 +11,21 @@ export interface GroupedProjection extends Projection { groups: ProjectedGroup[]
 export interface ProjectionOptions {
   forcedIds?: Set<string>; markedIds?: Set<string>; format?: string; project?: string; role?: string; folder?: string;
   direction?: 'both' | 'incoming' | 'outgoing';
+  queryNodeIds?: Set<string>; queryRelationIds?: Set<string>; branchNodeIds?: Set<string>; branchRelationIds?: Set<string>;
+}
+export function activeBranchContributions(baseIds: Set<string>, branches: readonly { anchorId: string; result?: { nodeIds: string[]; relationIds: string[] } }[]): { nodeIds: Set<string>; relationIds: Set<string> } {
+  const reached = new Set(baseIds), nodeIds = new Set<string>(), relationIds = new Set<string>(), applied = new Set<number>();
+  let advanced = true;
+  while (advanced) {
+    advanced = false;
+    branches.forEach((branch, index) => {
+      if (applied.has(index) || !branch.result || !reached.has(branch.anchorId)) return;
+      applied.add(index); advanced = true;
+      for (const id of branch.result.nodeIds) { reached.add(id); nodeIds.add(id); }
+      for (const id of branch.result.relationIds) relationIds.add(id);
+    });
+  }
+  return { nodeIds, relationIds };
 }
 
 export function displayLabels(nodes: GraphNode[]): Map<string, string> {
@@ -99,10 +114,18 @@ export function projectGraph(graph: GraphSnapshot, view: ViewState, options: Pro
     && (!folder || folder === '.' || !!node.file && (node.file.path === folder || node.file.path.startsWith(`${folder}/`)))
     && (!options.markedIds || options.markedIds.has(node.id))
   )).map(node => node.id));
-  if (view.mode === 'file') eligible = collectNeighbourhood({ nodeIds: graph.nodes.map(node => node.id), relations: graph.relations,
-    eligibleIds: eligible, focusId: view.focusId, depth: view.depth, direction: options.direction, forcedIds: forced, nodeDepths: view.nodeDepths });
+  if (options.queryNodeIds) eligible = new Set([...eligible].filter(id => options.queryNodeIds!.has(id) || options.branchNodeIds?.has(id) || forced.has(id)));
+  else if (view.mode === 'file') {
+    const filtered = eligible;
+    eligible = collectNeighbourhood({ nodeIds: graph.nodes.map(node => node.id), relations: graph.relations,
+      eligibleIds: eligible, focusId: view.focusId, depth: view.depth, direction: options.direction, forcedIds: forced, nodeDepths: view.nodeDepths });
+    for (const id of options.branchNodeIds ?? []) if (filtered.has(id)) eligible.add(id);
+  }
+  for (const id of options.branchNodeIds ?? []) if (eligible.has(id)) protectedIds.add(id);
+  for (const id of options.queryNodeIds ?? []) if (eligible.has(id)) protectedIds.add(id);
   for (const id of Object.keys(view.nodeDepths ?? {})) if (eligible.has(id)) protectedIds.add(id);
-  const subset = { ...graph, nodes: graph.nodes.filter(node => eligible.has(node.id)), relations: graph.relations.filter(edge => eligible.has(edge.sourceId) && eligible.has(edge.targetId)) };
+  const subset = { ...graph, nodes: graph.nodes.filter(node => eligible.has(node.id)), relations: graph.relations.filter(edge => eligible.has(edge.sourceId) && eligible.has(edge.targetId)
+    && (!options.queryRelationIds || options.queryRelationIds.has(edge.id) || options.branchRelationIds?.has(edge.id))) };
   return view.collapseReexports ? collapseEdges(subset, protectedIds) : { nodes: subset.nodes, edges: subset.relations.map(edge => ({ id: edge.id, sourceId: edge.sourceId,
     targetId: edge.targetId, relations: [edge], collapsed: false })) };
 }
@@ -152,6 +175,7 @@ export class GraphCanvas {
   private previousDepthKey = '';
   private matches = new Set<string>();
   private resizeFrame = 0;
+  private preserveNextCamera = false;
   constructor(container: HTMLElement, private callbacks: {
     selection: (value: CanvasSelection) => void; open: (nodeId: string) => void; toggleGroup: (groupId: string) => void;
     context: (nodeId: string, point: { x: number; y: number }) => void; save: (state: SavedCanvas) => void;
@@ -212,7 +236,7 @@ export class GraphCanvas {
       { selector: ':selected', style: { 'underlay-color': token('focusBorder', '#00b7ff'), 'underlay-opacity': 0.3, 'underlay-padding': 6, opacity: 1 } }
     ]);
   }
-  render(projection: GroupedProjection, view: ViewState, appearance: GraphAppearance, matches = new Set<string>()): void {
+  render(projection: GroupedProjection, view: ViewState, appearance: GraphAppearance, matches = new Set<string>(), preserveCamera = false): void {
     if (this.first && !projection.nodes.length && !projection.groups.length) return;
     const previousProjection = this.previousProjection;
     const depthKey = JSON.stringify(Object.entries(view.nodeDepths ?? {}).sort(([left], [right]) => left.localeCompare(right)));
@@ -236,6 +260,7 @@ export class GraphCanvas {
         for (const id of matches) if (!this.matches.has(id)) this.cy.getElementById(id).addClass('search-match');
       });
       this.matches = new Set(matches);
+      this.preserveNextCamera = false;
       return;
     }
     const previous = this.state();
@@ -262,7 +287,34 @@ export class GraphCanvas {
     for (const edge of projection.edges) elements.push({ data: { id: edge.id, source: edge.sourceId, target: edge.targetId,
       inferred: edge.relations.some(item => item.certainty === 'inferred') ? true : undefined,
       collapsed: edge.collapsed ? true : undefined, color: edge.relations.map(item => appearance.edgeColors.get(item.id)).find(Boolean) } });
-    this.cy.batch(() => { this.cy.elements().remove(); this.cy.add(elements); });
+    this.cy.batch(() => {
+      const desired = new Set(elements.map(item => item.data.id!));
+      this.cy.edges().filter(edge => !desired.has(edge.id())).remove();
+      const syncData = (current: ReturnType<Core['getElementById']>, data: ElementDefinition['data']) => {
+        for (const key of Object.keys(current.data())) if (!['id', 'parent', 'source', 'target'].includes(key) && data[key] === undefined) current.removeData(key);
+        current.data(data);
+      };
+      for (const item of elements.filter(item => item.data.group)) {
+        const current = this.cy.getElementById(item.data.id!);
+        if (current.length) syncData(current, item.data); else this.cy.add(item);
+      }
+      for (const item of elements.filter(item => !item.data.group && !item.data.source)) {
+        const current = this.cy.getElementById(item.data.id!);
+        if (!current.length) this.cy.add(item);
+        else {
+          if (current.data('parent') !== item.data.parent) current.move({ parent: item.data.parent ?? null });
+          syncData(current, item.data);
+          current.toggleClass('search-match', matches.has(current.id()));
+        }
+      }
+      this.cy.nodes().filter(node => !desired.has(node.id())).remove();
+      for (const item of elements.filter(item => !!item.data.source)) {
+        let current = this.cy.getElementById(item.data.id!);
+        if (current.length && (current.data('source') !== item.data.source || current.data('target') !== item.data.target)) { current.remove(); current = this.cy.getElementById(item.data.id!); }
+        if (current.length) syncData(current, item.data); else this.cy.add(item);
+      }
+      for (const node of projection.nodes) if (positions[node.id]) this.cy.getElementById(node.id).position(positions[node.id]);
+    });
     const newNodes = this.cy.nodes().filter(node => (!node.data('group') || node.data('collapsedGroup')) && !positions[node.id()]);
     if (this.first && Object.keys(positions).length === 0) {
       const restoreCamera = this.restored.zoom !== undefined || this.restored.pan !== undefined;
@@ -272,8 +324,12 @@ export class GraphCanvas {
       if (!restoreCamera && view.mode === 'file') { this.cy.zoom(1); if (view.focusId) this.cy.center(this.cy.getElementById(view.focusId)); }
     }
     else {
-      const center = { x: this.cy.width() / 2, y: this.cy.height() / 2 };
-      newNodes.forEach((node, index) => { node.position({ x: center.x + Math.cos(index * 2.4) * (40 + index * 5), y: center.y + Math.sin(index * 2.4) * (40 + index * 5) }); });
+      const center = { x: (this.cy.width() / 2 - (previous.pan?.x ?? 0)) / (previous.zoom ?? 1), y: (this.cy.height() / 2 - (previous.pan?.y ?? 0)) / (previous.zoom ?? 1) };
+      newNodes.forEach((node, index) => {
+        const neighbour = node.connectedEdges().connectedNodes().filter(item => !!positions[item.id()])[0];
+        const anchor = neighbour ? positions[neighbour.id()] : center;
+        node.position({ x: anchor.x + Math.cos(index * 2.4) * (75 + index * 8), y: anchor.y + Math.sin(index * 2.4) * (75 + index * 8) });
+      });
       if (this.first && this.restored.zoom) this.cy.zoom(this.restored.zoom);
       else if (!this.first) this.cy.zoom(previous.zoom ?? 1);
       if (this.first && this.restored.pan) this.cy.pan(this.restored.pan);
@@ -283,7 +339,8 @@ export class GraphCanvas {
     if (projection.nodes.length || projection.groups.length) this.first = false;
     this.previousProjection = projection; this.previousFocus = view.focusId; this.previousAppearance = appearance; this.previousDepthKey = depthKey; this.matches = new Set(matches);
     this.previousMode = view.mode;
-    if (navigate && view.focusId) this.center(view.focusId);
+    if (navigate && view.focusId && !preserveCamera && !this.preserveNextCamera) this.center(view.focusId);
+    this.preserveNextCamera = false;
   }
   select(nodeIds: string[], relationIds: string[] = []): void {
     const desired = new Set(nodeIds.filter(id => this.cy.getElementById(id).length > 0));
@@ -299,7 +356,7 @@ export class GraphCanvas {
     if (nodeId) {
       const zoom = Math.max(1, this.cy.zoom()), position = (target[0] as NodeSingular).position();
       this.cy.animate({ zoom, pan: { x: this.cy.width() / 2 - position.x * zoom, y: this.cy.height() / 2 - position.y * zoom }, duration: 150 });
-    } else this.cy.animate({ fit: { eles: target, padding: 45 }, duration: 150 });
+    } else this.cy.animate({ fit: { eles: target, padding: Math.min(45, Math.max(8, Math.min(this.cy.width(), this.cy.height()) * 0.12)) }, duration: 150 });
   }
   zoomBy(factor: number): void {
     this.cy.stop(); this.cy.zoom({ level: this.cy.zoom() * factor, renderedPosition: { x: this.cy.width() / 2, y: this.cy.height() / 2 } });
@@ -315,6 +372,12 @@ export class GraphCanvas {
   state(): SavedCanvas {
     this.cy.nodes().filter(node => !node.data('group') || node.data('collapsedGroup')).forEach(node => { this.retainedPositions[node.id()] = { ...node.position() }; });
     return { positions: { ...this.retainedPositions }, zoom: this.cy.zoom(), pan: { ...this.cy.pan() } };
+  }
+  restore(state: SavedCanvas = {}): void {
+    this.cy.stop(); this.retainedPositions = { ...state.positions }; this.restored = state; this.preserveNextCamera = true;
+    this.cy.batch(() => { for (const [id, position] of Object.entries(state.positions ?? {})) { const node = this.cy.getElementById(id); if (node.length) node.position(position); } });
+    if (state.zoom !== undefined) this.cy.zoom(state.zoom);
+    if (state.pan) this.cy.pan(state.pan);
   }
   destroy(): void {
     clearTimeout(this.saveTimer); cancelAnimationFrame(this.resizeFrame); this.themeObserver.disconnect(); this.resizeObserver.disconnect();

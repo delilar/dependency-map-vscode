@@ -43,6 +43,15 @@ try {
   await file(child, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } } }));
   await file(child, 'src/child.ts', 'import { value } from "@/value"; export { value };\n');
   await file(child, 'src/value.ts', 'export const value = 10;\n');
+  // Test setup only: product code never invokes Git or activates its provider.
+  for (const root of [web, child]) {
+    const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null' };
+    for (const args of [['init', '--quiet', root], ['-C', root, 'config', 'core.fsmonitor', 'false'], ['-C', root, 'add', 'src/value.ts']]) {
+      const initialized = spawnSync('git', args, { env: gitEnv, encoding: 'utf8', windowsHide: true });
+      assert.equal(initialized.status, 0, 'isolated Git fixture must initialize');
+    }
+  }
+  await file(web, 'src/value.ts', 'export const value = 1;\n// Unstaged test fixture change.\n');
   await writeFile(workspace, JSON.stringify({ folders: [{ name: 'web', path: web }, { name: 'child', path: child }], settings: { 'security.workspace.trust.enabled': false, 'workbench.startupEditor': 'none' } }));
   let extensionPath = project;
   if (process.env.DEPENDENCY_MAP_TEST_PACKAGE === '1') {

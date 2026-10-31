@@ -2,6 +2,7 @@ import type { AnnotationGroup } from '../host/annotations';
 import type { AnnotationResult } from '../shared/protocol';
 import { GroupDraft } from './group-draft';
 import { createColorPalette } from './palette';
+import { DEFAULT_GROUP_COLOR } from './group-draft';
 
 export interface GroupCommand {
   action: 'createGroup' | 'createGroupAndMark' | 'updateGroup' | 'deleteGroup' | 'mark' | 'unmark' | 'markFolder';
@@ -17,6 +18,9 @@ export interface GroupControlsState {
 export interface GroupControls {
   element: HTMLElement;
   update(state: GroupControlsState): void;
+  hasDraft(): boolean;
+  saveDraft(): Promise<boolean>;
+  discardDraft(): void;
   destroy(): void;
 }
 
@@ -27,6 +31,7 @@ export function createGroupControls(callbacks: { activateGroup(groupId?: string)
   let feedback = '';
   let feedbackError = false;
   let sequence = 0;
+  let awaitingSave: { requestId: string; resolve(ok: boolean): void; timer: ReturnType<typeof setTimeout> } | undefined;
   const element = document.createElement('section'); element.className = 'group-controls';
   const make = <K extends keyof HTMLElementTagNameMap>(tag: K, text = '') => { const item = document.createElement(tag); item.textContent = text; return item; };
   const label = (text: string, control: HTMLElement) => { const item = make('label'); item.className = 'control'; item.append(make('span', text), control); control.setAttribute('aria-label', text); return item; };
@@ -120,9 +125,26 @@ export function createGroupControls(callbacks: { activateGroup(groupId?: string)
       if (result && pending?.requestId === result.requestId) {
         if (result.ok && ['createGroup', 'createGroupAndMark', 'updateGroup'].includes(result.action)) draft.saved();
         pending = undefined; feedback = result.message; feedbackError = !result.ok;
+        if (awaitingSave?.requestId === result.requestId) { clearTimeout(awaitingSave.timer); awaitingSave.resolve(result.ok); awaitingSave = undefined; }
       }
       render();
     },
-    destroy() { palette.destroy(); }
+    hasDraft() { return draft.dirty || !!pending; },
+    saveDraft() {
+      if (!draft.dirty) return Promise.resolve(!pending);
+      if (pending || !draft.valid) return Promise.resolve(false);
+      return new Promise(resolve => {
+        issue(active() ? 'updateGroup' : 'createGroup', { name: draft.name.trim(), color: draft.color, nodeIds: [], relationIds: [] });
+        if (!pending) { resolve(false); return; }
+        const requestId = pending.requestId;
+        awaitingSave = { requestId, resolve, timer: setTimeout(() => { if (awaitingSave?.requestId === requestId) { awaitingSave = undefined; resolve(false); } }, 15000) };
+      });
+    },
+    discardDraft() {
+      palette.cancel(false);
+      const group = active(); draft.name = group?.name ?? ''; draft.color = group?.color ?? DEFAULT_GROUP_COLOR; draft.dirty = false;
+      render();
+    },
+    destroy() { if (awaitingSave) { clearTimeout(awaitingSave.timer); awaitingSave.resolve(false); } palette.destroy(); }
   };
 }

@@ -72,6 +72,20 @@ try {
   const camera = await page.evaluate(() => { const { cy } = window.harness; cy.zoom(1.3); cy.pan({ x: 71, y: 42 }); window.harness.render(); return { zoom: cy.zoom(), pan: cy.pan() }; });
   await page.setViewportSize({ width: 940, height: 620 }); await page.waitForTimeout(120);
   assert.deepEqual(await page.evaluate(() => ({ zoom: window.harness.cy.zoom(), pan: window.harness.cy.pan() })), camera, 'Projection updates and resize preserve camera');
+  const stable = await page.evaluate(() => {
+    const { cy, ids } = window.harness;
+    window.harness.setView({ depth: 1 });
+    const anchor = cy.getElementById(ids[1])[0];
+    anchor.position({ x: 215, y: 170 }); anchor.select();
+    const before = { position: { ...anchor.position() }, pan: { ...cy.pan() }, zoom: cy.zoom() };
+    window.harness.setView({ depth: 2 });
+    const same = cy.getElementById(ids[1])[0] === anchor;
+    const after = { position: { ...cy.getElementById(ids[1]).position() }, pan: { ...cy.pan() }, zoom: cy.zoom() };
+    return { same, before, after, selected: cy.getElementById(ids[1]).selected(), adjacent: cy.getElementById(ids[2]).position() };
+  });
+  assert(stable.same, 'Projection diff retains existing Cytoscape elements');
+  assert(stable.selected, 'Incremental additions retain selection');
+  assert.deepEqual(stable.after, stable.before, 'Incremental additions retain exact leaf positions and camera');
   const click = await page.evaluate(() => { const { cy, ids } = window.harness; cy.zoom(1); cy.center(cy.getElementById(ids[0])); return cy.getElementById(ids[0]).renderedPosition(); });
   await page.mouse.click(click.x, click.y, { button: 'right' });
   assert.equal(await page.evaluate(() => window.context?.id), 'file:app:src/A.tsx', 'Canvas right click reaches real file context action');

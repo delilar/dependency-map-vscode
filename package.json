@@ -2,7 +2,7 @@
   "name": "dependency-map-vscode",
   "displayName": "Dependency Map",
   "description": "Explore file dependencies and annotate task groups in frontend workspaces.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "local-tools",
   "license": "MIT",
   "repository": {
@@ -43,6 +43,10 @@
       {
         "command": "dependencyMap.bindRoots",
         "title": "Dependency Map: Bind Shared Roots"
+      },
+      {
+        "command": "dependencyMap.diagnostics",
+        "title": "Dependency Map: Show Diagnostics"
       }
     ],
     "menus": {
@@ -90,7 +94,7 @@
     "test": "node scripts/test.mjs",
     "test:integration": "node scripts/run-integration.mjs",
     "test:persistence": "npm run build && node scripts/test-persistence.mjs",
-    "test:ui": "npm run build && node scripts/ui-smoke.mjs && node scripts/ui-fixes.mjs",
+    "test:ui": "npm run build && node scripts/ui-smoke.mjs && node scripts/ui-fixes.mjs && node scripts/ui-analytics.mjs",
     "benchmark:ui": "npm run build && node scripts/ui-benchmark.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "render:project": "npm run build && node scripts/render-project.mjs",

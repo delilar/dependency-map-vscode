@@ -6,6 +6,8 @@ Installed `node_modules` trees are excluded from project analysis. Environment v
 
 ## Dependency status
 
+Version 0.2.0 also hard-excludes `.git` from source inventory, resolution, overlays, and navigation, including when custom exclusions are empty. Git integration reads only the cache of an already active built-in provider; product code does not activate the provider, invoke Git, request status refreshes, or read patches. Query witnesses, local task views, and diagnostic export contain references or allowlisted metadata rather than source contents. CommonJS and unsupported export provenance cannot establish a unique ESM declaration.
+
 As of 2026-10-31, version 0.1.2 updates PostCSS and minimatch patches and disables automatic stylesheet source-map loading. A regression test checks that source-map comments cannot cause filesystem probes or reads, including paths outside the input file's directory.
 
 The locked dependency tree still has **four moderate npm audit findings**, involving `glob`, `minimatch`, `stylus`, and the `@vscode/vsce` packaging dependency. These are not a claim of four independent runtime exploits, and their presence should not be treated as a clean audit. The broad automatic fix suggests breaking dependency changes, so it has not been applied blindly.

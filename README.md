@@ -37,6 +37,20 @@ Adding a folder takes a snapshot of its current files; future files are not adde
 
 For multiple workspace roots, select the coordinating root on first save. Use **Dependency Map: Bind Shared Roots** when saved roots cannot be matched after moving a workspace.
 
+## Investigate a change (0.2.0)
+
+Select a file and open **Исследовать зависимости**. Analytical queries pause editor following and use the full available index; display filters can hide a result without removing its evidence. Return with **Вернуться к обычной карте**.
+
+- **Impact:** find direct and indirect consumers and statically connected test candidates. Choose depth and whether to include inferred or type-only relations. This does not predict breakage or measure test coverage.
+- **Directed branches:** use **Ещё входящие** or **Ещё исходящие** in file details or the context menu. Each action adds one directed step. Collapse removes only that branch's contribution; camera and existing file positions stay in place.
+- **Import path:** choose two files to find one directed path of confirmed imports/reexports, including intermediate files hidden by display filters. Limits and unknown dependencies are shown explicitly.
+- **Symbol focus:** select an export or imported binding to inspect supported ESM aliases and reexport provenance. Ambiguous stars, CommonJS, namespaces, missing modules, and unsupported cases remain labelled. Imports do not prove calls or data flow.
+- **Git changes:** inspect cached metadata from an already active built-in Git provider, with separate staged, unstaged, conflict, untracked, and dirty-editor flags. Select a repository or analyse the union of its indexed changed files. Use Source Control to refresh Git itself. The graph represents current files and editor overlays, not staged or historical source text. Deleted rows retain their status without invented old edges.
+- **My task view:** explicitly save one local return point per shared group, preview missing references or changed groups, and restore the available view. Contexts stay in VS Code workspace storage; shared JSON v1 is unchanged. Restore pins the map. Unsaved group properties/notes require Save, Discard, or Stay.
+- **Versions and freshness:** inspect running host/worker/Webview build identities and index state. Diagnostic copying requires a preview and includes allowlisted versions, reasons, counters, and timings, without source text or absolute paths.
+
+Queries are bounded to 10,000 visited nodes, 50,000 examined relations, and a 1,500 ms soft deadline; depth-based queries accept 1–20 steps. Limits produce an explicit partial result. The analytical canvas displays up to 500 files, with results and evidence available separately. A found witness proves its shown static relationships; an empty result does not prove that a change is safe.
+
 ## Analysis support
 
 | Input | Support |

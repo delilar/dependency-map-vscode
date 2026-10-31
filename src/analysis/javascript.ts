@@ -1,24 +1,27 @@
 import ts from 'typescript';
 import valueParser from 'postcss-value-parser';
 import type { Binding, Evidence, SourceRange } from '../shared/model';
+import type { ExportEntry } from '../shared/query-model';
 
 export interface Reference {
   specifier?: string; kind: 'import' | 'reexport' | 'resource' | 'config' | 'framework' | 'environment';
   bindings: Binding[]; evidence: Evidence; reason?: string; envName?: string;
   certainty?: 'confirmed' | 'inferred';
+  occurrences?: (Binding & { range: SourceRange; exported?: string })[];
 }
 export interface JsResult {
   references: Reference[]; diagnostics: string[];
   childName?: string; childReferences: { name: string; evidence: Evidence }[];
   providers: { token: TokenRef; evidence: Evidence }[];
   consumers: { token: TokenRef; evidence: Evidence }[];
-  exports: { name: string; range: SourceRange; forwarded?: { module: string; imported: string } }[];
+  exports: { name: string; range: SourceRange; namespace: ExportEntry['namespace']; kind: ExportEntry['kind']; forwarded?: { module: string; imported: string; referenceKind: 'import' | 'reexport' } }[];
+  unsupportedExports?: boolean;
 }
 export interface TokenRef { name: string; module?: string }
 export function extractJavascript(path: string, text: string): JsResult {
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-  const result: JsResult = { references: [], diagnostics: [], childReferences: [], providers: [], consumers: [], exports: [] };
-  const imported = new Map<string, { module: string; name: string }>();
+  const result: JsResult = { references: [], diagnostics: [], childReferences: [], providers: [], consumers: [], exports: [], unsupportedExports: /\.(?:cjs|cts)$/i.test(path) };
+  const imported = new Map<string, { module: string; name: string; typeOnly: boolean }>();
   const range = (node: ts.Node): SourceRange => ({ start: source.getLineAndCharacterOfPosition(node.getStart(source)), end: source.getLineAndCharacterOfPosition(node.getEnd()) });
   const evidence = (node: ts.Node, rule: string): Evidence => ({ rule, range: range(node) });
   const add = (node: ts.Node, specifier: string | undefined, kind: Reference['kind'], bindings: Binding[], rule: string, reason?: string) => {
@@ -55,7 +58,7 @@ export function extractJavascript(path: string, text: string): JsResult {
     const clause = statement.importClause;
     const bindings: Binding[] = [];
     const remember = (local: string, name: string, typeOnly: boolean) => {
-      bindings.push({ imported: name, local, typeOnly }); imported.set(local, { module: (statement.moduleSpecifier as ts.StringLiteral).text, name });
+      bindings.push({ imported: name, local, typeOnly }); imported.set(local, { module: (statement.moduleSpecifier as ts.StringLiteral).text, name, typeOnly });
     };
     if (clause?.name) remember(clause.name.text, 'default', clause.isTypeOnly);
     if (clause?.namedBindings) {
@@ -63,39 +66,56 @@ export function extractJavascript(path: string, text: string): JsResult {
       else for (const item of clause.namedBindings.elements) remember(item.name.text, item.propertyName?.text ?? item.name.text, clause.isTypeOnly || item.isTypeOnly);
     }
     add(statement.moduleSpecifier, statement.moduleSpecifier.text, 'import', bindings, 'JavaScript import');
+    const occurrences: NonNullable<Reference['occurrences']> = [];
+    if (clause?.name) occurrences.push({ imported: 'default', local: clause.name.text, typeOnly: clause.isTypeOnly, range: range(clause.name) });
+    if (clause?.namedBindings) {
+      if (ts.isNamespaceImport(clause.namedBindings)) occurrences.push({ imported: '*', local: clause.namedBindings.name.text, typeOnly: clause.isTypeOnly, range: range(clause.namedBindings) });
+      else for (const item of clause.namedBindings.elements) occurrences.push({ imported: item.propertyName?.text ?? item.name.text, local: item.name.text, typeOnly: clause.isTypeOnly || item.isTypeOnly, range: range(item) });
+    }
+    result.references[result.references.length - 1].occurrences = occurrences;
   }
   const locals = new Map<string, SourceRange>();
+  const localNamespaces = new Map<string, ExportEntry['namespace']>();
+  const namespaceLocals = new Set<string>();
   for (const statement of source.statements) {
     if (ts.isVariableStatement(statement)) {
-      for (const declaration of statement.declarationList.declarations) for (const name of boundNames(declaration.name)) locals.set(name, range(declaration.name));
-    } else if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) || ts.isEnumDeclaration(statement)) && statement.name) locals.set(statement.name.text, range(statement.name));
+      for (const declaration of statement.declarationList.declarations) for (const name of boundNames(declaration.name)) { locals.set(name, range(declaration.name)); localNamespaces.set(name, 'value'); }
+    } else if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) || ts.isEnumDeclaration(statement)) && statement.name) {
+      locals.set(statement.name.text, range(statement.name));
+      localNamespaces.set(statement.name.text, ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) ? 'type' : ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement) ? 'both' : 'value');
+    } else if (ts.isModuleDeclaration(statement)) {
+      locals.set(statement.name.text, range(statement.name)); localNamespaces.set(statement.name.text, 'both'); namespaceLocals.add(statement.name.text);
+    }
   }
   for (const statement of source.statements) {
     const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) ?? [] : [];
     const exported = modifiers.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword);
     const defaultExport = modifiers.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword);
     if (exported && ts.isVariableStatement(statement)) {
-      for (const declaration of statement.declarationList.declarations) for (const name of boundNames(declaration.name)) result.exports.push({ name, range: locals.get(name)! });
+      for (const declaration of statement.declarationList.declarations) for (const name of boundNames(declaration.name)) result.exports.push({ name, range: locals.get(name)!, namespace: 'value', kind: 'direct' });
     } else if (exported && (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) || ts.isEnumDeclaration(statement))) {
-      if (defaultExport) result.exports.push({ name: 'default', range: statement.name ? range(statement.name) : range(statement) });
-      else if (statement.name) result.exports.push({ name: statement.name.text, range: range(statement.name) });
+      const namespace = ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) ? 'type' : ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement) ? 'both' : 'value';
+      if (defaultExport) result.exports.push({ name: 'default', range: statement.name ? range(statement.name) : range(statement), namespace, kind: 'direct' });
+      else if (statement.name) result.exports.push({ name: statement.name.text, range: range(statement.name), namespace, kind: 'direct' });
     } else if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
       const symbol = ts.isIdentifier(statement.expression) ? statement.expression.text : undefined;
       const importedSymbol = symbol ? imported.get(symbol) : undefined;
-      result.exports.push({ name: 'default', range: symbol && locals.has(symbol) ? locals.get(symbol)! : range(statement.expression), forwarded: importedSymbol ? { module: importedSymbol.module, imported: importedSymbol.name } : undefined });
+      result.exports.push({ name: 'default', range: symbol && locals.has(symbol) ? locals.get(symbol)! : range(statement.expression), namespace: 'value', kind: importedSymbol ? 'forward' : 'direct', forwarded: importedSymbol ? { module: importedSymbol.module, imported: importedSymbol.name, referenceKind: 'import' } : undefined });
     } else if (ts.isExportDeclaration(statement)) {
       const module = literal(statement.moduleSpecifier);
       if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
         for (const entry of statement.exportClause.elements) {
           const originalName = entry.propertyName?.text ?? entry.name.text;
           const importedSymbol = imported.get(originalName);
-          if (module) result.exports.push({ name: entry.name.text, range: range(entry), forwarded: { module, imported: originalName } });
-          else if (locals.has(originalName)) result.exports.push({ name: entry.name.text, range: locals.get(originalName)! });
-          else if (importedSymbol) result.exports.push({ name: entry.name.text, range: range(entry), forwarded: { module: importedSymbol.module, imported: importedSymbol.name } });
+          const namespace = statement.isTypeOnly || entry.isTypeOnly ? 'type' : module ? 'both' : importedSymbol?.typeOnly ? 'type' : localNamespaces.get(originalName) ?? 'both';
+          if (module) result.exports.push({ name: entry.name.text, range: range(entry), namespace, kind: 'forward', forwarded: { module, imported: originalName, referenceKind: 'reexport' } });
+          else if (locals.has(originalName)) result.exports.push({ name: entry.name.text, range: locals.get(originalName)!, namespace, kind: namespaceLocals.has(originalName) ? 'namespace' : 'direct' });
+          else if (importedSymbol) result.exports.push({ name: entry.name.text, range: range(entry), namespace, kind: 'forward', forwarded: { module: importedSymbol.module, imported: importedSymbol.name, referenceKind: 'import' } });
+          else result.exports.push({ name: entry.name.text, range: range(entry), namespace, kind: 'forward' });
         }
-      } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) result.exports.push({ name: statement.exportClause.name.text, range: range(statement.exportClause) });
-      else if (module) result.exports.push({ name: '*', range: range(statement), forwarded: { module, imported: '*' } });
-    }
+      } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) result.exports.push({ name: statement.exportClause.name.text, range: range(statement.exportClause), namespace: statement.isTypeOnly ? 'type' : 'both', kind: 'namespace', forwarded: module ? { module, imported: '*', referenceKind: 'reexport' } : undefined });
+      else if (module) result.exports.push({ name: '*', range: range(statement), namespace: statement.isTypeOnly ? 'type' : 'both', kind: 'star', forwarded: { module, imported: '*', referenceKind: 'reexport' } });
+    } else if (exported && ts.isModuleDeclaration(statement)) result.exports.push({ name: statement.name.text, range: range(statement.name), namespace: 'both', kind: 'namespace' });
   }
   const apiName = (node: ts.Expression): { module: string; name: string } | undefined => {
     if (ts.isIdentifier(node)) return declared(node.text, node, false) ? undefined : imported.get(node.text);
@@ -125,11 +145,33 @@ export function extractJavascript(path: string, text: string): JsResult {
     });
   };
   const visit = (node: ts.Node) => {
+    // CommonJS can mutate exports through defineProperty/assign or an alias, not only a direct assignment.
+    if (ts.isIdentifier(node) && ['exports', 'module'].includes(node.text) && !declared(node.text, node)) {
+      const parent = node.parent;
+      const propertyName = ts.isPropertyAccessExpression(parent) && parent.name === node
+        || ts.isPropertyAssignment(parent) && parent.name === node
+        || ts.isPropertyDeclaration(parent) && parent.name === node
+        || ts.isMethodDeclaration(parent) && parent.name === node;
+      if (!propertyName) result.unsupportedExports = true;
+    }
     if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
       const bindings: Binding[] = node.exportClause && ts.isNamedExports(node.exportClause)
         ? node.exportClause.elements.map(item => ({ imported: item.propertyName?.text ?? item.name.text, local: item.name.text, typeOnly: node.isTypeOnly || item.isTypeOnly }))
         : [{ imported: '*', typeOnly: node.isTypeOnly }];
       add(node.moduleSpecifier, node.moduleSpecifier.text, 'reexport', bindings, 'JavaScript re-export');
+      result.references[result.references.length - 1].occurrences = node.exportClause && ts.isNamedExports(node.exportClause)
+        ? node.exportClause.elements.map(item => ({ imported: item.propertyName?.text ?? item.name.text, local: item.name.text, exported: item.name.text, typeOnly: node.isTypeOnly || item.isTypeOnly, range: range(item) }))
+        : [{ imported: '*', exported: node.exportClause && ts.isNamespaceExport(node.exportClause) ? node.exportClause.name.text : '*', typeOnly: node.isTypeOnly, range: range(node) }];
+    }
+    if (ts.isExportAssignment(node) && node.isExportEquals) result.unsupportedExports = true;
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+      const left = node.left;
+      if (ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left)) {
+        const base = left.expression;
+        if (ts.isIdentifier(base) && base.text === 'exports' && !declared('exports', node)) result.unsupportedExports = true;
+        if (ts.isIdentifier(base) && base.text === 'module' && !declared('module', node)) result.unsupportedExports = true;
+        if ((ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) && ts.isIdentifier(base.expression) && base.expression.text === 'module' && !declared('module', node)) result.unsupportedExports = true;
+      }
     }
     if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
       add(node.moduleReference, literal(node.moduleReference.expression), 'import', [{ imported: '*', local: node.name.text, typeOnly: node.isTypeOnly }], 'TypeScript import equals', literal(node.moduleReference.expression) === undefined ? 'Computed import-equals target' : undefined);

@@ -8,6 +8,9 @@ import { fileId, relationId, type AnalysisOptions, type DeclarationTarget, type 
 import { extractJavascript, type JsResult, type Reference, type TokenRef } from './javascript';
 import { extractEnvKeys, extractResources } from './resources';
 import { classifyFile, type RoleContext } from '../shared/roles';
+import { formatCapabilities } from './formats';
+import type { BindingOccurrence, ExportEntry, FileCoverage } from '../shared/query-model';
+import { exportTables, resolveExport } from './export-resolution';
 export { formatCapabilities } from './formats';
 
 const slash = (value: string) => value.replace(/\\/g, '/');
@@ -15,6 +18,7 @@ const canonical = (value: string) => process.platform === 'win32' ? path.resolve
 const within = (parent: string, child: string) => { const relative = path.relative(canonical(parent), canonical(child)); return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)); };
 const javascript = /\.(?:[cm]?[jt]s|[jt]sx)$/i;
 const isEnv = (value: string) => /^\.env(?:\.|$)/i.test(path.basename(value));
+const forbiddenPath = (value: string) => slash(value).split('/').some(part => ['.git', 'node_modules'].includes(part.toLowerCase()));
 const builtins = new Set(builtinModules.map(name => name.replace(/^node:/, '')));
 const maxTextBytes = 2 * 1024 * 1024;
 type ParsedSource = ReturnType<typeof extractJavascript> | ReturnType<typeof extractResources>;
@@ -41,7 +45,9 @@ function parseSource(file: string, text: string): { result: ParsedSource; reused
 }
 
 export class WorkspaceFiles {
-  readonly files = new Map<string, { path: string; root: WorkspaceRoot }>();
+  readonly files = new Map<string, { path: string; root: WorkspaceRoot; physical: boolean }>();
+  readonly readReasons = new Map<string, 'textLimit' | 'readFailed'>();
+  readonly inventoryFailures = new Set<string>();
   private readonly safeCache = new Map<string, boolean>();
   private readonly overlay: Map<string, SourceOverlay>;
   constructor(readonly roots: WorkspaceRoot[], readonly exclude: string[], overlays: SourceOverlay[]) {
@@ -57,27 +63,29 @@ export class WorkspaceFiles {
   allowed(candidate: string): boolean {
     const key = canonical(candidate);
     if (this.safeCache.has(key)) return this.safeCache.get(key)!;
-    if (slash(key).split('/').includes('node_modules')) return false;
+    if (forbiddenPath(key)) return false;
     const root = this.roots.find(item => within(item.path, candidate));
     if (!root) return false;
     const relative = slash(path.relative(root.path, candidate));
-    if (relative && relative.split('/').some(part => part === 'node_modules')) return false;
+    if (forbiddenPath(relative)) return false;
     if (this.exclude.some(pattern => relative.split('/').includes(pattern) || minimatch(relative, pattern, { dot: true }) || minimatch(relative, `${pattern}/**`, { dot: true }))) return false;
     let allowed = true;
     try {
       const physical = fs.realpathSync(candidate);
-      allowed = !slash(canonical(physical)).split('/').includes('node_modules') && this.roots.some(item => within(item.path, physical));
+      allowed = !forbiddenPath(physical) && this.roots.some(item => within(item.path, physical));
     } catch { /* Missing candidates are safe to test but cannot resolve. */ }
     this.safeCache.set(key, allowed);
     return allowed;
   }
   scan(): void {
-    this.files.clear(); this.safeCache.clear();
+    this.files.clear(); this.safeCache.clear(); this.readReasons.clear(); this.inventoryFailures.clear();
     this.scanTargets(this.roots.map(root => root.path));
   }
   update(changes: string[]): void {
     this.safeCache.clear();
     for (const [key, entry] of this.files) if (changes.some(changed => within(changed, entry.path))) this.files.delete(key);
+    for (const key of this.readReasons.keys()) if (changes.some(changed => within(changed, key))) this.readReasons.delete(key);
+    for (const key of this.inventoryFailures) if (changes.some(changed => within(changed, key))) this.inventoryFailures.delete(key);
     this.scanTargets(changes);
   }
   private scanTargets(targets: string[]): void {
@@ -86,15 +94,16 @@ export class WorkspaceFiles {
       if (!this.allowed(directory) || seen.has(canonical(directory))) return;
       seen.add(canonical(directory));
       let entries: fs.Dirent[];
-      try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return; }
+      try { entries = fs.readdirSync(directory, { withFileTypes: true }); this.inventoryFailures.delete(canonical(directory)); }
+      catch { this.inventoryFailures.add(canonical(directory)); return; }
       for (const entry of entries) {
-        if (entry.name === 'node_modules') continue;
+        if (forbiddenPath(entry.name)) continue;
         const full = path.join(directory, entry.name);
         if (!this.allowed(full) || entry.isSymbolicLink()) continue;
         if (entry.isDirectory()) walk(full);
         else if (entry.isFile()) {
           const root = this.roots.find(item => within(item.path, full));
-          if (root) this.files.set(canonical(full), { path: full, root });
+          if (root) this.files.set(canonical(full), { path: full, root, physical: true });
         }
       }
     };
@@ -107,19 +116,20 @@ export class WorkspaceFiles {
         if (stat.isDirectory()) walk(actual);
         else if (stat.isFile()) {
           const root = this.roots.find(item => within(item.path, actual));
-          if (root) this.files.set(canonical(actual), { path: actual, root });
+          if (root) this.files.set(canonical(actual), { path: actual, root, physical: true });
         }
-      } catch { /* A deleted file is removed from the inventory, not an analysis failure. */ }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.inventoryFailures.add(canonical(candidate)); }
     }
     for (const overlay of this.overlay.values()) {
       const root = this.roots.find(item => within(item.path, overlay.path));
       if (root && this.allowed(overlay.path)) {
         const key = canonical(overlay.path);
         let physical = this.files.get(key)?.path;
+        let exists = this.files.get(key)?.physical ?? false;
         if (!physical) {
-          try { physical = fs.realpathSync.native(overlay.path); } catch { /* Unsaved new files have no physical path yet. */ }
+          try { physical = fs.realpathSync.native(overlay.path); exists = fs.lstatSync(physical).isFile(); } catch { /* Unsaved new files have no physical path yet. */ }
         }
-        this.files.set(key, { path: physical ?? path.resolve(overlay.path), root });
+        this.files.set(key, { path: physical ?? path.resolve(overlay.path), root, physical: exists });
       }
     }
   }
@@ -132,12 +142,17 @@ export class WorkspaceFiles {
   }
   read(candidate: string): string | undefined {
     if (!this.allowed(candidate)) return undefined;
+    const key = canonical(candidate);
+    this.readReasons.delete(key);
     const overlay = this.overlay.get(canonical(candidate));
-    if (overlay?.text !== undefined) return overlay.text.length * 2 <= maxTextBytes ? overlay.text : undefined;
+    if (overlay?.text !== undefined) {
+      if (overlay.text.length * 2 > maxTextBytes) { this.readReasons.set(key, 'textLimit'); return undefined; }
+      return overlay.text;
+    }
     try {
-      if (fs.statSync(candidate).size > maxTextBytes) return undefined;
+      if (fs.statSync(candidate).size > maxTextBytes) { this.readReasons.set(key, 'textLimit'); return undefined; }
       return fs.readFileSync(candidate, 'utf8');
-    } catch { return undefined; }
+    } catch { this.readReasons.set(key, 'readFailed'); return undefined; }
   }
   env(candidate: string): EnvKey[] {
     const overlay = this.overlay.get(canonical(candidate));
@@ -530,41 +545,65 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
       }
     }
   }
+  const coverage: FileCoverage[] = [];
+  const diagnosticFiles = new Set(diagnostics.map(item => item.fileId));
+  const unresolvedCounts = new Map<string, number>();
+  for (const reference of unresolved) unresolvedCounts.set(reference.sourceId, (unresolvedCounts.get(reference.sourceId) ?? 0) + 1);
+  for (const entry of files.files.values()) {
+    const node = byPath.get(canonical(entry.path))!;
+    const readReason = files.readReasons.get(canonical(entry.path));
+    const format = formatCapabilities[node.format];
+    const configFile = /^(?:package|(?:ts|js)config(?:\.[^.]+)*)\.json$/.test(path.basename(entry.path));
+    const nodeOnly = format?.mode === 'node-only' && !configFile || !format && !configFile;
+    const result = javascriptResults.get(node.id)?.result;
+    const deferred = ['.vue', '.svelte', '.astro', '.mdx', '.graphql', '.gql', '.sass'].includes(node.format);
+    const reasonCodes = readReason ? [readReason] : nodeOnly ? [deferred ? 'unsupportedInternalReferences' : 'resourceNode'] : [];
+    if (diagnosticFiles.has(node.id) && !nodeOnly) reasonCodes.push(configFile ? 'configurationDiagnostic' : 'parseDiagnostic');
+    if (result?.unsupportedExports) reasonCodes.push('unsupportedCommonJs');
+    const unresolvedCount = unresolvedCounts.get(node.id) ?? 0;
+    if (unresolvedCount) reasonCodes.push('unresolvedReference');
+    coverage.push({ fileId: node.id, status: readReason === 'readFailed' ? 'failed' : readReason ? 'skipped' : nodeOnly ? 'nodeOnly' : 'parsed', reasonCodes, unresolvedCount });
+  }
+  const exports: ExportEntry[] = [];
+  const bindingOccurrences: BindingOccurrence[] = [];
+  const sourceRelations = new Map<string, Map<string, Relation>>();
+  for (const edge of relations.values()) {
+    const map = sourceRelations.get(edge.sourceId) ?? new Map<string, Relation>();
+    map.set(JSON.stringify([edge.kind, edge.specifier]), edge); sourceRelations.set(edge.sourceId, map);
+  }
+  for (const [sourceId, entry] of javascriptResults) {
+    const relationFor = (kind: string, specifier: string) => sourceRelations.get(sourceId)?.get(JSON.stringify([kind, specifier]));
+    for (const exported of entry.result.exports) exports.push({
+      fileId: sourceId, name: exported.name, namespace: exported.namespace, kind: exported.kind, range: exported.range,
+      ...(exported.forwarded ? { forwarded: { relationId: relationFor(exported.forwarded.referenceKind, exported.forwarded.module)?.id, imported: exported.forwarded.imported } } : {})
+    });
+    for (const reference of entry.result.references) {
+      if (!reference.specifier || !reference.occurrences) continue;
+      const edge = relationFor(reference.kind, reference.specifier);
+      if (edge) for (const occurrence of reference.occurrences) bindingOccurrences.push({ relationId: edge.id, ...occurrence });
+    }
+  }
+  coverage.sort((a, b) => a.fileId < b.fileId ? -1 : a.fileId > b.fileId ? 1 : 0);
+  const stableRows = (a: unknown, b: unknown) => JSON.stringify(a).localeCompare(JSON.stringify(b));
+  exports.sort(stableRows); bindingOccurrences.sort(stableRows);
   const declarations: DeclarationTarget[] = [];
-  const declarationCache = new Map<string, Omit<DeclarationTarget, 'relationId' | 'imported'>>();
-  const declaration = (targetId: string, importedName: string, visited: Set<string>): Omit<DeclarationTarget, 'relationId' | 'imported'> | undefined => {
-    const key = JSON.stringify([targetId, importedName]);
-    if (visited.has(key) || importedName === '*') return undefined;
-    if (declarationCache.has(key)) return declarationCache.get(key);
-    const target = nodes.get(targetId); const entry = javascriptResults.get(targetId);
-    if (!target?.file || !entry) return undefined;
-    const nextVisited = new Set(visited).add(key);
-    const explicit = entry.result.exports.filter(item => item.name === importedName);
-    const exports = explicit.length ? explicit : importedName === 'default' ? [] : entry.result.exports.filter(item => item.name === '*');
-    const matches: Omit<DeclarationTarget, 'relationId' | 'imported'>[] = [];
-    for (const exported of exports) {
-      if (!exported.forwarded) { matches.push({ file: target.file, range: exported.range }); continue; }
-      const resolved = resolve(entry.path, exported.forwarded.module, 'reexport').node;
-      if (!resolved) continue;
-      const found = declaration(resolved.id, exported.forwarded.imported === '*' ? importedName : exported.forwarded.imported, nextVisited);
-      if (found) matches.push(found);
-    }
-    const unique = [...new Map(matches.map(item => [JSON.stringify(item), item])).values()];
-    if (unique.length === 1) {
-      if (!exports.some(item => item.forwarded)) declarationCache.set(key, unique[0]);
-      return unique[0];
-    }
-    return undefined;
-  };
+  const symbolGraph: GraphSnapshot = { revision: 0, nodes: [...nodes.values()], relations: [...relations.values()], unresolved, diagnostics, exports, coverage, stats: { files: files.files.size, relations: relations.size, elapsedMs: 0 } };
+  const tables = exportTables(symbolGraph);
   for (const relation of relations.values()) {
     if (!['import', 'reexport'].includes(relation.kind)) continue;
-    for (const importedName of new Set(relation.bindings.map(binding => binding.imported))) {
-      const found = declaration(relation.targetId, importedName, new Set());
-      if (found) declarations.push({ relationId: relation.id, imported: importedName, ...found });
+    for (const binding of relation.bindings) {
+      if (binding.imported === '*') continue;
+      const resolution = resolveExport(tables, relation.targetId, binding.imported, binding.typeOnly ? 'type' : 'both');
+      const found = resolution.status === 'resolved' ? resolution.candidates[0] : undefined;
+      const file = found ? nodes.get(found.fileId)?.file : undefined;
+      if (found?.range && file && !declarations.some(item => item.relationId === relation.id && item.imported === binding.imported)) declarations.push({ relationId: relation.id, imported: binding.imported, file, range: found.range });
     }
   }
   onProgress(`${incremental ? 'Incremental' : 'Full'} analysis: ${processed} affected source files; reused ${reusedContributions} contributions; parsed ${processed - reusedSources}, parsing-cache hits ${reusedSources}`);
-  const graph: GraphSnapshot = { revision: (previous?.graph.revision ?? 0) + 1, nodes: [...nodes.values()], relations: [...relations.values()], unresolved, diagnostics, declarations, stats: { files: files.files.size, relations: relations.size, elapsedMs: Math.round(performance.now() - started) } };
+  const graph: GraphSnapshot = { revision: (previous?.graph.revision ?? 0) + 1, nodes: [...nodes.values()], relations: [...relations.values()], unresolved, diagnostics, declarations, coverage, exports, bindingOccurrences,
+    coverageReasons: files.inventoryFailures.size ? ['inventoryReadFailed'] : [],
+    physicalFileIds: [...files.files.values()].filter(entry => entry.physical).map(entry => byPath.get(canonical(entry.path))!.id).sort(),
+    stats: { files: files.files.size, relations: relations.size, elapsedMs: Math.round(performance.now() - started) } };
   return { graph, state: { key: contextKey, files, projects, configs, configDiagnostics, configInputs, configTexts, contributions, resolutionCache: resolvedReferences, lookups, envKeys, graph } };
 }
 

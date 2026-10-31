@@ -66,6 +66,10 @@ test('navigation denies traversal, node_modules and escaped symlink', async () =
     assert.equal(await resolveAllowedFile({ rootId: 'app', path: 'file.ts' }, roots), path.join(root, 'file.ts'));
     await assert.rejects(resolveAllowedFile({ rootId: 'app', path: '../outside.ts' }, roots));
     await assert.rejects(resolveAllowedFile({ rootId: 'app', path: 'node_modules/x.js' }, roots));
+    await assert.rejects(resolveAllowedFile({ rootId: 'app', path: '.git/config' }, roots));
+    await assert.rejects(resolveAllowedFile({ rootId: 'app', path: '.GIT/config' }, roots));
+    await assert.rejects(resolveAllowedFile({ rootId: 'hidden', path: 'config' }, [{ id: 'hidden', name: 'hidden', path: path.join(directory, '.git') }]));
+    await assert.rejects(resolveAllowedFile({ rootId: 'hidden', path: 'index.js' }, [{ id: 'hidden', name: 'hidden', path: path.join(directory, 'node_modules') }]));
     try { await symlink(directory, path.join(root, 'escape'), 'junction'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') return; throw error; }
     await assert.rejects(resolveAllowedFile({ rootId: 'app', path: 'escape/outside.ts' }, roots));

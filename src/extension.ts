@@ -8,7 +8,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dependencyMap.openFile', (uri?: vscode.Uri) => session.open('file', uri)),
     vscode.commands.registerCommand('dependencyMap.openProject', () => session.open('project')),
     vscode.commands.registerCommand('dependencyMap.bindRoots', () => session.bindRoots()),
-    vscode.commands.registerCommand('dependencyMap.rebuild', () => session.rebuild())
+    vscode.commands.registerCommand('dependencyMap.rebuild', () => session.rebuild()),
+    vscode.commands.registerCommand('dependencyMap.diagnostics', () => session.diagnostics())
   );
   if (process.env.DEPENDENCY_MAP_TEST === '1') context.subscriptions.push(
     vscode.commands.registerCommand('dependencyMap.inspect', () => session.inspect()),

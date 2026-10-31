@@ -24,6 +24,11 @@ export interface GraphSnapshot {
   unresolved: UnresolvedReference[]; diagnostics: Diagnostic[];
   stats: { files: number; relations: number; elapsedMs: number };
   declarations?: DeclarationTarget[];
+  coverage?: import('./query-model').FileCoverage[];
+  exports?: import('./query-model').ExportEntry[];
+  bindingOccurrences?: import('./query-model').BindingOccurrence[];
+  physicalFileIds?: string[];
+  coverageReasons?: string[];
 }
 export interface EnvKey { name: string; range?: SourceRange }
 export interface SourceOverlay { path: string; version: number; text?: string; envKeys?: EnvKey[] }

@@ -1,11 +1,14 @@
 import { emptyGraph, initialView, type FileRef, type GraphNode, type Relation, type ViewState } from '../shared/model';
 import type { HostState, HostMessage, UiMessage, SavedUiState } from '../shared/protocol';
-import { GraphCanvas, groupProjection, projectGraph, searchGraph, type CanvasSelection, type ProjectedGroup } from './graph';
+import { GraphCanvas, groupProjection, projectGraph, searchGraph, activeBranchContributions, type CanvasSelection, type ProjectedGroup, type ProjectionOptions } from './graph';
 import { PanelLayout } from './panels';
 import { NodeDepthMenu } from './context-menu';
 import { ROLE_LABELS } from '../shared/roles';
 import { createGroupControls } from './group-controls';
 import { createGraphAppearance, groupFilterIds, type AnnotationGroup, type AnnotationRelation } from './appearance';
+import { AnalysisWorkbench, chooseDraftAction } from './analysis-workbench';
+import { buildInfo } from '../shared/build-info';
+import type { TaskContextData } from '../shared/query-model';
 
 declare global { interface Window { __dependencyMapInitialState?: SavedUiState } }
 declare function acquireVsCodeApi(): { postMessage(message: UiMessage): void; getState(): SavedUiState | undefined; setState(value: SavedUiState): void };
@@ -26,6 +29,12 @@ let noteDraft = { key: '', text: '', dirty: false };
 let pendingNote: { requestId: string; key: string } | undefined;
 let noteSequence = 0;
 let panels: PanelLayout;
+let workbench: AnalysisWorkbench;
+let visibleNodeIds = new Set<string>();
+let restoredContextToken = '';
+let pendingNoteSave: { requestId: string; resolve(ok: boolean): void; timer: ReturnType<typeof setTimeout> } | undefined;
+let draftTransition = false;
+let retainedSelectionIds = new Set<string>();
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text = ''): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
@@ -51,7 +60,7 @@ function updateView(patch: Partial<ViewState>): void {
   state.view = { ...state.view, ...patch }; api.postMessage({ type: 'setView', view: state.view }); render();
   if (changedMode && patch.mode === 'project') canvas.center();
 }
-function changeFilters(): void { forcedIds.clear(); renderProjection(); }
+function changeFilters(): void { forcedIds.clear(); retainedSelectionIds.clear(); renderProjection(); }
 function sameFile(left: FileRef | undefined, right: FileRef | undefined): boolean { return !!left && !!right && left.rootId === right.rootId && left.path === right.path; }
 function relationMarked(mark: AnnotationRelation, edge: Relation): boolean {
   const source = state.graph.nodes.find(node => node.id === edge.sourceId);
@@ -127,7 +136,7 @@ stage.append(stageToolbar, canvasElement, empty, legend);
 const inspector = element('aside', 'inspector'); inspector.setAttribute('aria-label', 'Детали и группы задач');
 const tasksPanel = element('section', 'panel-upper');
 const detailsPanel = element('section', 'panel-lower');
-const groupControls = createGroupControls({ activateGroup: id => updateView({ activeGroupId: id }), command: command => api.postMessage({ type: 'annotation', ...command }) });
+const groupControls = createGroupControls({ activateGroup: id => { void resolveDrafts().then(ok => { if (ok) updateView({ activeGroupId: id }); else renderDetails(); }); }, command: command => api.postMessage({ type: 'annotation', ...command }) });
 const selectionSummary = element('p', 'small');
 const showColors = checkbox('Показывать цвета задач', showGroupColors, value => { showGroupColors = value; renderProjection(); persist(); });
 const note = element('textarea'); note.rows = 3; note.maxLength = 10000; note.placeholder = 'Заметка к выбранному файлу или связи';
@@ -151,7 +160,8 @@ panels = new PanelLayout(shell, content, saved.panelSizes, persist);
 sidebar.append(filtersPanel, panels.handles.leftTop, resultsPanel); inspector.append(tasksPanel, panels.handles.rightTop, detailsPanel);
 content.append(sidebar, panels.handles.left, stage, panels.handles.right, inspector, panels.handles.narrowCanvas);
 shell.insertBefore(panels.handles.toolbar, content);
-const depthMenu = new NodeDepthMenu((nodeId, value) => api.postMessage({ type: 'setNodeDepth', nodeId, depth: value }));
+const depthMenu = new NodeDepthMenu((nodeId, value) => api.postMessage({ type: 'setNodeDepth', nodeId, depth: value }),
+  (nodeId, direction, action) => api.postMessage({ type: 'branch', nodeId, direction, action }));
 document.body.append(depthMenu.element);
 
 const canvas = new GraphCanvas(canvasElement, {
@@ -161,16 +171,78 @@ const canvas = new GraphCanvas(canvasElement, {
   selection: value => { if (rendering) return; selected = value; renderDetails(); },
   save: value => { canvasState = value; persist(); }
 }, saved.canvas);
+workbench = new AnalysisWorkbench({
+  send: message => api.postMessage(message),
+  reveal: (nodeIds, relationIds = []) => {
+    for (const id of nodeIds) forcedIds.add(id);
+    selected = { nodeIds: nodeIds.slice(0, 500), relationIds };
+    renderProjection(); renderDetails();
+  },
+  select: nodeId => {
+    selected = { nodeIds: [nodeId], relationIds: [] }; renderDetails();
+    canvas.select(selected.nodeIds);
+  },
+  contextData, beforeRestore: resolveDrafts
+});
+const narrowQuery = window.matchMedia('(max-width: 759px)');
+function placeQuerySummary(): void {
+  if (narrowQuery.matches) workbench.element.insertBefore(workbench.summary, workbench.element.children[1] ?? null);
+  else stage.insertBefore(workbench.summary, canvasElement);
+}
+narrowQuery.addEventListener('change', placeQuerySummary); placeQuerySummary();
+detailsPanel.insertBefore(workbench.element, details);
+tasksPanel.append(workbench.tasks);
+problems.append(workbench.diagnostics);
 function openDepthMenu(nodeId: string, point?: { x: number; y: number }, opener?: HTMLElement): void {
   const node = state.graph.nodes.find(item => item.id === nodeId);
   if (!node || node.kind !== 'file') return;
-  depthMenu.open(node.id, node.file?.path ?? node.label, state.view.nodeDepths?.[node.id], point, opener, state.view.mode === 'file', direction.value === 'both');
+  depthMenu.open(node.id, node.file?.path ?? node.label, state.view.nodeDepths?.[node.id], point, opener, state.view.mode === 'file', direction.value === 'both',
+    !!state.analytics?.runtime.compatible && state.analytics.index.state === 'ready' && (state.view.mode === 'file' || !!state.analytics.active));
 }
 
+function localUiState(): SavedUiState {
+  return { canvas: canvasState, query: searchInput.value, format: format.value, project: project.value, role: role.value, folder: folder.value, direction: direction.value, groupOnly: groupOnly.input.checked, collapsedGroupIds: [...collapsedGroupIds], panelSizes: panels?.state(), showGroupColors };
+}
 function persist(): void {
-  const next: SavedUiState = { canvas: canvasState, query: searchInput.value, format: format.value, project: project.value, role: role.value, folder: folder.value, direction: direction.value, groupOnly: groupOnly.input.checked, collapsedGroupIds: [...collapsedGroupIds], panelSizes: panels?.state(), showGroupColors };
+  const next = localUiState();
   api.setState(next);
-  api.postMessage({ type: 'saveLocalState', state: next });
+  api.postMessage({ type: 'saveLocalState', state: next, contextToken: state.analytics?.uiStateToken });
+}
+function contextData(): TaskContextData {
+  canvasState = canvas.state();
+  return { view: { ...state.view }, ui: localUiState(), query: state.analytics?.active?.query,
+    branches: (state.analytics?.branches ?? []).map(({ result, ...branch }) => branch), selection: { nodeIds: [...selected.nodeIds], relationIds: [...selected.relationIds] } };
+}
+async function resolveDrafts(): Promise<boolean> {
+  if (draftTransition || pendingNote) return false;
+  if (!groupControls.hasDraft() && !noteDraft.dirty) return true;
+  draftTransition = true;
+  try {
+    const choice = await chooseDraftAction();
+    if (choice === 'stay') return false;
+    if (choice === 'discard') { groupControls.discardDraft(); noteDraft.dirty = false; return true; }
+    if (!await groupControls.saveDraft()) return false;
+    if (!noteDraft.dirty) return true;
+    if (saveNote.disabled) { noteHint.textContent = 'Заметку нельзя сохранить: сначала пометьте выбранный элемент. Переход отменён.'; return false; }
+    return await new Promise<boolean>(resolve => {
+      saveNote.click();
+      if (!pendingNote) { resolve(false); return; }
+      const requestId = pendingNote.requestId;
+      pendingNoteSave = { requestId, resolve, timer: setTimeout(() => { if (pendingNoteSave?.requestId === requestId) { pendingNoteSave = undefined; resolve(false); } }, 15000) };
+    });
+  } finally { draftTransition = false; }
+}
+function restoreLocalContext(data: TaskContextData): void {
+  const ui = data.ui;
+  searchInput.value = ui.query ?? ''; format.value = ui.format ?? ''; project.value = ui.project ?? ''; role.value = ui.role ?? ''; folder.value = ui.folder ?? ''; direction.value = ui.direction ?? 'both';
+  groupOnly.input.checked = !!ui.groupOnly; showGroupColors = ui.showGroupColors !== false; showColors.input.checked = showGroupColors;
+  collapsedGroupIds.clear(); for (const id of ui.collapsedGroupIds ?? []) collapsedGroupIds.add(id);
+  selected = { nodeIds: [...data.selection.nodeIds], relationIds: [...data.selection.relationIds] };
+  forcedIds.clear(); panels.restore(ui.panelSizes); canvasState = ui.canvas; canvas.restore(ui.canvas); noteDraft.dirty = false;
+}
+function applyPendingRestore(): void {
+  const restore = state.analytics?.taskContexts.restore;
+  if (restore && restore.token !== restoredContextToken) { restoredContextToken = restore.token; restoreLocalContext(restore.data); }
 }
 function toggleGroup(groupId: string): void {
   const group = visibleGroups.find(item => item.id === groupId);
@@ -208,25 +280,41 @@ function render(): void {
   renderProjection(); renderDetails();
 }
 function renderStatus(): void {
-  status.textContent = `${state.status} · ${state.graph.stats.files} файлов · ${state.graph.stats.relations} связей · ревизия ${state.graph.revision}`;
+  status.textContent = `${state.analytics ? `v${state.analytics.runtime.host.extensionVersion} · ${state.analytics.index.state} · ` : ''}${state.status} · ${state.graph.stats.files} файлов · ${state.graph.stats.relations} связей · ревизия ${state.graph.revision}`;
+  status.title = status.textContent;
 }
 function renderProjection(): void {
   const group = activeGroup();
   const marks = group ? groupFilterIds(state.graph, group) : undefined;
-  const projection = projectGraph(state.graph, state.view, { forcedIds, markedIds: groupOnly.input.checked ? (marks ?? new Set()) : undefined,
-    format: format.value, project: project.value, role: role.value, folder: folder.value, direction: direction.value as 'both' | 'incoming' | 'outgoing' });
+  const active = state.analytics?.active;
+  const answer = active?.result?.operation === 'success' ? active.result : active?.previousResult;
+  retainedSelectionIds = new Set([...retainedSelectionIds].filter(id => selected.nodeIds.includes(id)));
+  const revealed = new Set([...forcedIds, ...retainedSelectionIds]);
+  const options: ProjectionOptions = { forcedIds: revealed, markedIds: groupOnly.input.checked ? (marks ?? new Set()) : undefined,
+    format: format.value, project: project.value, role: role.value, folder: folder.value, direction: direction.value as 'both' | 'incoming' | 'outgoing',
+    queryNodeIds: answer ? new Set(answer.nodeIds) : undefined,
+    queryRelationIds: answer ? new Set(answer.relationIds) : undefined };
+  const base = projectGraph(state.graph, state.view, options);
+  const contributions = activeBranchContributions(new Set(base.nodes.map(n => n.id)), state.analytics?.branches ?? []);
+  const projection = contributions.nodeIds.size ? projectGraph(state.graph, state.view, { ...options, branchNodeIds: contributions.nodeIds, branchRelationIds: contributions.relationIds }) : base;
+  if ((state.analytics?.active || contributions.nodeIds.size) && projection.nodes.length > 500) {
+    const keep = new Set([...new Set([...selected.nodeIds, ...forcedIds, ...projection.nodes.map(n => n.id)])].slice(0, 500));
+    projection.nodes = projection.nodes.filter(n => keep.has(n.id)); projection.edges = projection.edges.filter(e => keep.has(e.sourceId) && keep.has(e.targetId));
+  }
   const matching = searchGraph(state.graph, searchInput.value);
-  const grouped = groupProjection(projection, state.view.groupBy, collapsedGroupIds, forcedIds);
+  const grouped = groupProjection(projection, state.view.groupBy, collapsedGroupIds, revealed);
   visibleGroups = grouped.groups;
   const appearance = createGraphAppearance(state.graph, group, grouped.groups, showGroupColors);
   rendering = true;
-  canvas.render(grouped, state.view, appearance, new Set(matching.map(node => node.id)));
+  canvas.render(grouped, state.view, appearance, new Set(matching.map(node => node.id)), !!state.analytics?.active);
   canvas.select(selected.nodeIds, selected.relationIds);
   rendering = false;
   const visible = new Set(grouped.nodes.map(node => node.id));
+  visibleNodeIds = visible;
+  workbench?.update(state, selected, visible);
   const nodes = searchInput.value.trim() ? matching : projection.nodes;
   const collapsedCount = grouped.groups.filter(item => item.collapsed).length;
-  graphSummary.textContent = `${grouped.nodes.length} файлов${collapsedCount ? ` + ${collapsedCount} областей` : ''} · ${grouped.edges.length} связей`;
+  graphSummary.textContent = `${grouped.nodes.length} файлов${collapsedCount ? ` + ${collapsedCount} областей` : ''} · ${grouped.edges.length} связей${retainedSelectionIds.size ? ` · сохранено выбранных: ${retainedSelectionIds.size}` : ''}`;
   resultSummary.textContent = searchInput.value.trim() ? `Найдено ${nodes.length} во всём индексе` : `На карте ${nodes.length} файлов и пакетов`;
   results.replaceChildren();
   groupList.replaceChildren();
@@ -262,6 +350,7 @@ function renderProjection(): void {
   persist();
 }
 function renderDetails(): void {
+  if ([...retainedSelectionIds].some(id => !selected.nodeIds.includes(id))) { retainedSelectionIds = new Set([...retainedSelectionIds].filter(id => selected.nodeIds.includes(id))); renderProjection(); }
   const hasSelection = selected.nodeIds.length + selected.relationIds.length > 0;
   const group = activeGroup();
   const canMark = !!group && hasSelection;
@@ -288,6 +377,7 @@ function renderDetails(): void {
     if (node.kind === 'external') (actions.lastChild as HTMLButtonElement).disabled = true;
     details.append(actions);
     if (node.kind === 'file') {
+      details.append(workbench.fileActions(node));
       const localDepth = state.view.nodeDepths?.[node.id];
       const depthAction = button(localDepth === undefined ? 'Индивидуальная глубина…' : `Глубина для узла: ${localDepth}`, () => openDepthMenu(node.id));
       depthAction.disabled = state.view.mode === 'project';
@@ -313,6 +403,7 @@ function renderDetails(): void {
       element('p', 'path', edge.specifier ?? ''), element('p', '', edge.bindings.map(binding => `${binding.typeOnly ? 'type ' : ''}${binding.imported}${binding.local && binding.local !== binding.imported ? ` as ${binding.local}` : ''}`).join(', ') || 'Связь без импортированных имён'));
     for (const item of edge.evidence) details.append(element('p', 'hint', `${item.rule}${item.range ? ` · строка ${item.range.start.line + 1}` : ''}`));
     details.append(button('Перейти к обращению', () => api.postMessage({ type: 'openEvidence', relationId: edge.id })));
+    details.append(workbench.bindingActions(edge));
     for (const imported of new Set(edge.bindings.map(binding => binding.imported))) {
       if (imported === '*') continue;
       const declaration = state.graph.declarations?.find(item => item.relationId === edge.id && item.imported === imported);
@@ -335,6 +426,7 @@ function renderDetails(): void {
     problemList.append(element('p', 'hint', `${source?.file?.path ? `${source.file.path}: ` : ''}${item.message}`));
   }
   if (diagnostics.length > 100) problemList.append(element('p', 'hint', 'Показаны первые 100 диагностик.'));
+  workbench?.update(state, selected, visibleNodeIds);
 }
 function appendRelations(edges: Relation[], endpoint: 'sourceId' | 'targetId'): void {
   for (const edge of edges.slice(0, 100)) {
@@ -361,21 +453,31 @@ window.addEventListener('message', event => {
       if (message.ok && pendingNote.key === noteDraft.key) noteDraft.dirty = false;
       pendingNote = undefined;
     }
+    if (pendingNoteSave?.requestId === message.requestId) { clearTimeout(pendingNoteSave.timer); pendingNoteSave.resolve(message.ok); pendingNoteSave = undefined; }
     renderDetails(); return;
   }
   if (message?.type === 'status') {
-    if (typeof message.status !== 'string' || !Number.isInteger(message.revision) || message.revision < state.graph.revision) return;
-    state.status = message.status; renderStatus(); return;
+    if (typeof message.status !== 'string' || !Number.isInteger(message.revision)
+      || message.revision < state.graph.revision && (!message.analytics || message.analytics.index.version.epoch === state.analytics?.index.version.epoch)) return;
+    state.status = message.status; if (message.analytics) { retainSelectionOnCollapse(message.analytics); state.analytics = message.analytics; applyPendingRestore(); render(); } else renderStatus(); return;
   }
+  if (message?.type === 'diagnostics') { workbench.showDiagnostics(message.text); return; }
   if (message?.type !== 'state' || !message.graph || !message.view || !Array.isArray(message.graph.nodes)) return;
-  if (message.graph.revision < state.graph.revision) return;
+  if (message.graph.revision < state.graph.revision && (!message.analytics || message.analytics.index.version.epoch === state.analytics?.index.version.epoch)) return;
+  if (message.analytics) retainSelectionOnCollapse(message.analytics);
   state = message;
+  applyPendingRestore();
   const nodeIds = new Set(state.graph.nodes.map(node => node.id));
   const edgeIds = new Set(state.graph.relations.map(edge => edge.id));
   selected.nodeIds = selected.nodeIds.filter(id => nodeIds.has(id)); selected.relationIds = selected.relationIds.filter(id => edgeIds.has(id));
   forcedIds = new Set([...forcedIds].filter(id => nodeIds.has(id)));
   render();
 });
-window.addEventListener('pagehide', () => { canvasState = canvas.state(); persist(); canvas.destroy(); panels.destroy(); groupControls.destroy(); depthMenu.destroy(); });
+function retainSelectionOnCollapse(next: NonNullable<HostState['analytics']>): void {
+  const previous = state.analytics;
+  if (!previous || previous.index.version.epoch !== next.index.version.epoch || previous.active?.requestId !== next.active?.requestId) { retainedSelectionIds.clear(); return; }
+  if (previous.branches.some(b => !next.branches.some(n => n.id === b.id))) for (const id of selected.nodeIds) if (visibleNodeIds.has(id)) retainedSelectionIds.add(id);
+}
+window.addEventListener('pagehide', () => { narrowQuery.removeEventListener('change', placeQuerySummary); canvasState = canvas.state(); persist(); canvas.destroy(); panels.destroy(); groupControls.destroy(); depthMenu.destroy(); });
 render();
-api.postMessage({ type: 'ready' });
+api.postMessage({ type: 'ready', build: buildInfo });

@@ -9,13 +9,15 @@ export function sameFilePath(left: string, right: string): boolean {
 
 export async function resolveAllowedFile(ref: FileRef, roots: WorkspaceRoot[]): Promise<string> {
   const root = roots.find(item => item.id === ref.rootId);
-  if (!root || !ref.path || path.isAbsolute(ref.path) || ref.path.includes('\\') || ref.path.split('/').some(part => part === '..' || part === 'node_modules' || !part)) {
+  if (!root || !ref.path || path.isAbsolute(ref.path) || ref.path.includes('\\') || ref.path.split('/').some(part => part === '..' || ['node_modules', '.git'].includes(part.toLowerCase()) || !part)) {
     throw new Error('File is outside the indexed workspace.');
   }
+  if (root.path.split(/[\\/]/).some(part => ['node_modules', '.git'].includes(part.toLowerCase()))) throw new Error('File is outside the indexed workspace.');
   const rootPath = await realpath(root.path);
+  if (rootPath.split(/[\\/]/).some(part => ['node_modules', '.git'].includes(part.toLowerCase()))) throw new Error('File is outside the indexed workspace.');
   const filePath = await realpath(path.resolve(root.path, ref.path));
   const relative = path.relative(rootPath, filePath);
-  if (!relative || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative) || relative.split(path.sep).includes('node_modules')) {
+  if (!relative || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative) || relative.split(path.sep).some(part => ['node_modules', '.git'].includes(part.toLowerCase()))) {
     throw new Error('File is outside the indexed workspace.');
   }
   return filePath;

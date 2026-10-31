@@ -90,3 +90,23 @@ body.vscode-high-contrast button, body.vscode-high-contrast-light button { borde
 }
 @media (max-height: 450px) { .legend { display: none; } .toolbar { align-content: flex-start; } }
 @media (max-width: 420px) { .palette-swatches { grid-template-columns: repeat(4, 24px); } .palette-swatch { width: 24px; height: 24px; } }
+.analysis-workbench, .task-contexts, .runtime-diagnostics { margin: 8px 0; padding: 8px 0; border-bottom: 1px solid var(--vscode-panel-border, #39424a); min-width: 0; }
+.analysis-workbench > summary, .task-contexts > summary, .runtime-diagnostics > summary, .path-query > summary, .git-changes > summary { cursor: pointer; font-size: 12px; padding: 3px 0; }
+.analysis-controls { padding-top: 9px; }
+.path-query, .git-changes { margin-top: 11px; }
+.path-query .control { margin-top: 9px; }
+.query-summary { flex-shrink: 0; padding: 5px 10px; max-height: 120px; overflow: auto; border-bottom: 1px solid var(--vscode-panel-border, #39424a); background: var(--vscode-editorWidget-background, transparent); }
+.query-summary .actions { margin: 5px 0 0; }
+.analysis-workbench > .query-summary { max-height: none; overflow: visible; padding: 8px 0; }
+.query-summary button, .query-row button, .git-row button { font-size: 11px; }
+.analysis-status { font-size: 11px; overflow-wrap: anywhere; }
+.query-row, .git-row { padding: 8px 0; border-bottom: 1px solid var(--vscode-panel-border, #39424a); overflow-wrap: anywhere; }
+.query-row > button, .git-row > button { max-width: 100%; margin: 3px 3px 0 0; text-align: left; overflow-wrap: anywhere; }
+.analytical-actions { margin-top: 9px; }
+.analytical-actions details { flex-basis: 100%; }
+.analytical-actions details > button { display: block; margin: 4px 0; text-align: left; }
+.review-dialog { width: min(650px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow: auto; border: 1px solid var(--vscode-focusBorder, #1684d9); border-radius: 5px; padding: 16px; background: var(--vscode-editorWidget-background, var(--vscode-editor-background, #18212a)); color: var(--vscode-editor-foreground, #ddd); }
+.review-dialog::backdrop { background: #0007; }
+.review-dialog button { margin: 8px 7px 0 0; }
+.review-dialog textarea { resize: vertical; min-height: 90px; max-height: 55vh; }
+@media (max-height: 450px) { .query-summary { max-height: 76px; padding: 3px 6px; } }

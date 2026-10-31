@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import path from 'node:path';
-import { access, realpath } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { access, realpath, readFile } from 'node:fs/promises';
+import { randomUUID, createHash } from 'node:crypto';
 import { AnalysisClient } from './analysis-client';
 import { MapPanel } from './map-panel';
 import { resolveAllowedFile, sameFilePath } from './navigation';
@@ -10,6 +10,12 @@ import { extractEnvironmentKeys, isEnvironmentFile } from './environment';
 import { AnnotationStore, applyAnnotationMutation, createAnnotations, type AnnotationMutation, type AnnotationsDocument, type RelationRef } from './annotations';
 import { emptyGraph, fileId, initialView, type GraphNode, type GraphSnapshot, type SourceOverlay, type ViewState, type WorkspaceRoot } from '../shared/model';
 import { isViewState, type UiMessage } from '../shared/protocol';
+import { buildInfo, compatibleBuild } from '../shared/build-info';
+import { queryLimits, querySeeds, sameIndex, type AnalyticsState, type BranchIntent, type GitStatusSnapshot, type IndexState, type RuntimeState, type QuerySpec, type TaskContextState } from '../shared/query-model';
+import { QueryCoordinator } from './query-coordinator';
+import { PassiveGitState, type CachedGitExtension } from './git-state';
+import { LocalTaskContextStore, fingerprintGroup, previewTaskContext } from './task-contexts';
+import { formatDiagnostics } from './diagnostics';
 
 const defaultExclude = ['.git', 'dist', 'build', 'coverage', '.next', '.nuxt', '.output', '.cache', '.turbo'];
 
@@ -35,12 +41,36 @@ export class WorkspaceSession implements vscode.Disposable {
   private annotationQueue: Promise<void> = Promise.resolve();
   private initialized?: Promise<void>;
   private savedView = '';
+  private index: IndexState = { version: { epoch: randomUUID(), revision: 0, scopeRevision: 0 }, state: 'empty', reasonCodes: [] };
+  private runtime: RuntimeState = { host: buildInfo, installedVersion: buildInfo.extensionVersion, compatible: false, reasonCodes: ['webviewNotReady'] };
+  private readonly queries = new QueryCoordinator();
+  private branches: BranchIntent[] = [];
+  private readonly branchRequests = new Map<string, string>();
+  private exploreView?: ViewState;
+  private git?: GitStatusSnapshot;
+  private readonly gitProvider: PassiveGitState;
+  private readonly taskStore: LocalTaskContextStore;
+  private taskContexts: TaskContextState = { savedGroupIds: [], orphanedGroupIds: [] };
+  private diagnosticPreview?: string;
+  private taskPreviewGuard?: string;
+  private uiStateToken?: string;
+  private pendingRestoredQuery?: QuerySpec;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     const saved = context.workspaceState.get<unknown>('dependencyMap.view');
     this.view = isViewState(saved) ? saved : initialView();
-    this.client = new AnalysisClient(path.join(context.extensionPath, 'dist', 'worker.cjs'));
-    this.panel = new MapPanel(context.extensionUri, message => { void this.handle(message).catch(() => this.error('The requested action could not be completed.')); }, () => this.context.workspaceState.get('dependencyMap.uiState'));
+    this.client = new AnalysisClient(path.join(context.extensionPath, 'dist', 'worker.cjs'), worker => {
+      if (!worker) {
+        this.invalidateQueries('workerUnavailable'); this.indexStale = true;
+        this.index = { ...this.index, version: { ...this.index.version, epoch: randomUUID() }, state: 'failed', reasonCodes: ['workerUnavailable'] };
+      }
+      this.runtime = { ...this.runtime, worker }; this.updateCompatibility(); this.publish();
+    });
+    this.taskStore = new LocalTaskContextStore(context.workspaceState);
+    this.gitProvider = new PassiveGitState(() => vscode.extensions.getExtension('vscode.git') as CachedGitExtension | undefined, () => {
+      if (this.panel.isOpen()) { this.observeGit(); this.publish(); }
+    });
+    this.panel = new MapPanel(context.extensionUri, message => { void this.handle(message).catch(() => this.error('The requested action could not be completed.')); }, () => this.context.workspaceState.get('dependencyMap.uiState'), () => this.gitProvider.stop());
     this.subscriptions.push(
       vscode.workspace.onDidChangeTextDocument(event => { if (event.contentChanges.length) this.changed(event.document.uri); }),
       vscode.workspace.onDidSaveTextDocument(document => this.changed(document.uri)),
@@ -51,10 +81,12 @@ export class WorkspaceSession implements vscode.Disposable {
         if (id && this.graph.nodes.some(node => node.id === id) && this.view.focusId !== id) { this.view.focusId = id; this.publish(); }
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
+        this.invalidateQueries('scopeChanged');
         this.initialized = undefined;
         void this.initialize().then(() => { if (this.opened) return this.rebuild(); });
       }),
-      vscode.workspace.onDidChangeConfiguration(event => { if (event.affectsConfiguration('dependencyMap')) this.schedule(); })
+      vscode.workspace.onDidChangeConfiguration(event => { if (event.affectsConfiguration('dependencyMap')) { this.index = { ...this.index, version: { ...this.index.version, scopeRevision: this.index.version.scopeRevision + 1 } }; this.schedule(); } }),
+      vscode.extensions.onDidChange(() => { if (this.panel.isOpen()) { this.gitProvider.watch(); this.observeGit(); this.publish(); } })
     );
   }
 
@@ -65,6 +97,7 @@ export class WorkspaceSession implements vscode.Disposable {
   }
 
   private async initializeWorkspace(): Promise<void> {
+    this.index = { ...this.index, version: { ...this.index.version, scopeRevision: this.index.version.scopeRevision + 1 }, state: 'stale' };
     const bindings = this.context.workspaceState.get<Record<string, string>>('dependencyMap.rootBindings', {});
     this.roots = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === 'file').map(folder => ({
       id: bindings[folder.uri.toString()] ?? randomUUID(), name: folder.name, path: folder.uri.fsPath
@@ -95,6 +128,7 @@ export class WorkspaceSession implements vscode.Disposable {
       const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root.path, '**/*'));
       this.watchers.push(watcher, watcher.onDidChange(uri => this.changed(uri)), watcher.onDidCreate(uri => this.changed(uri)), watcher.onDidDelete(uri => this.changed(uri)));
     }
+    this.refreshTaskContexts();
   }
 
   private bindAnnotationRoots(): void {
@@ -119,6 +153,8 @@ export class WorkspaceSession implements vscode.Disposable {
     this.view.mode = mode;
     if (target) this.view.focusId = this.idForUri(target) ?? this.view.focusId;
     this.panel.reveal();
+    this.gitProvider.watch();
+    this.observeGit();
     this.publish();
     if (!this.graph.revision || this.indexStale) await this.rebuild(!this.graph.revision);
   }
@@ -140,6 +176,8 @@ export class WorkspaceSession implements vscode.Disposable {
     const newFocusRoot = this.roots.find(root => root.path === focusedRoot);
     this.view.focusId = oldFocus && newFocusRoot ? fileId({ rootId: newFocusRoot.id, path: oldFocus.path }) : undefined;
     this.graph = emptyGraph();
+    this.index = { ...this.index, version: { ...this.index.version, scopeRevision: this.index.version.scopeRevision + 1 }, state: 'stale' };
+    this.invalidateQueries('rootBindingsChanged');
     const bindings: Record<string, string> = {};
     for (const root of this.roots) bindings[vscode.Uri.file(root.path).toString()] = root.id;
     await this.context.workspaceState.update('dependencyMap.rootBindings', bindings);
@@ -148,7 +186,7 @@ export class WorkspaceSession implements vscode.Disposable {
   }
 
   inspect() {
-    return { type: 'state' as const, graph: this.graph, view: this.view, status: this.status, roots: this.roots, annotations: this.annotations, annotationError: this.annotationError, localState: this.context.workspaceState.get('dependencyMap.uiState'), panelReady: this.panel.isReady() };
+    return { type: 'state' as const, graph: this.graph, view: this.view, status: this.status, roots: this.roots, annotations: this.annotations, annotationError: this.annotationError, localState: this.context.workspaceState.get('dependencyMap.uiState'), panelReady: this.panel.isReady(), analytics: this.analytics() };
   }
 
   async testMessage(message: UiMessage): Promise<void> { await this.handle(message); }
@@ -168,9 +206,10 @@ export class WorkspaceSession implements vscode.Disposable {
       this.annotationQueue = this.annotationQueue.catch(() => {}).then(() => this.refreshAnnotations());
       return;
     }
+    if (this.annotationPath && sameFilePath(path.dirname(uri.fsPath), path.dirname(this.annotationPath)) && /^dependency-map\.json\.[0-9a-f-]{36}\.tmp$/i.test(path.basename(uri.fsPath))) return;
     const segments = uri.fsPath.split(/[\\/]/);
     const excluded = vscode.workspace.getConfiguration('dependencyMap').get<string[]>('exclude', defaultExclude);
-    if (segments.some(segment => segment === 'node_modules' || excluded.includes(segment))) return;
+    if (segments.some(segment => ['node_modules', '.git'].includes(segment.toLowerCase()) || excluded.includes(segment))) return;
     if (this.idForUri(uri)) this.schedule();
     if (this.idForUri(uri)) this.changedPaths.add(uri.fsPath);
   }
@@ -179,9 +218,12 @@ export class WorkspaceSession implements vscode.Disposable {
     if (!this.opened || this.disposed) return;
     if (this.timer) clearTimeout(this.timer);
     this.client.cancel();
+    this.invalidateQueries('workspaceChanged');
     this.running++;
     this.status = 'Workspace changed; index is out of date.';
     this.indexStale = true;
+    this.index = { ...this.index, state: 'stale', reasonCodes: ['workspaceChanged'] };
+    this.observeGit();
     this.publish();
     if (!this.panel.isOpen()) return;
     this.timer = setTimeout(() => { this.timer = undefined; if (this.panel.isOpen()) void this.rebuild(false); }, 350);
@@ -193,42 +235,78 @@ export class WorkspaceSession implements vscode.Disposable {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     const run = ++this.running;
     this.indexStale = true;
+    this.invalidateQueries('indexBuilding');
+    this.index = { ...this.index, state: 'building', reasonCodes: [] };
     this.status = 'Indexing workspace…';
     this.publish();
-    const overlays: SourceOverlay[] = vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file' && this.idForUri(document.uri) && !document.uri.fsPath.split(/[\\/]/).some(part => part.toLowerCase() === 'node_modules')).map(document => ({
+    const overlays: SourceOverlay[] = vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file' && this.idForUri(document.uri) && !document.uri.fsPath.split(/[\\/]/).some(part => ['node_modules', '.git'].includes(part.toLowerCase()))).map(document => ({
       path: document.uri.fsPath, version: document.version,
       ...(isEnvironmentFile(document.uri.fsPath) ? { envKeys: extractEnvironmentKeys(document.getText()) } : { text: document.getText() })
     }));
     try {
-      const graph = await this.client.analyze({ roots: this.roots, options: { exclude: vscode.workspace.getConfiguration('dependencyMap').get<string[]>('exclude', defaultExclude) }, overlays, ...(full ? {} : { changedPaths: [...this.changedPaths] }) }, message => {
+      const graph = await this.client.analyze({ roots: this.roots, options: { exclude: vscode.workspace.getConfiguration('dependencyMap').get<string[]>('exclude', defaultExclude) }, overlays, graphVersion: this.index.version, ...(full ? {} : { changedPaths: [...this.changedPaths] }) }, message => {
         if (run === this.running) { this.status = message; this.publish(); }
       });
       if (run !== this.running || !graph || this.disposed) return;
       this.graph = graph;
       this.changedPaths.clear();
       this.indexStale = false;
+      this.index = { version: { ...this.index.version, revision: graph.revision }, state: 'ready', reasonCodes: graph.coverageReasons ?? [] };
+      this.observeGit();
+      this.refreshTaskContexts();
       if (this.view.follow && vscode.window.activeTextEditor) {
         const active = this.idForUri(vscode.window.activeTextEditor.document.uri);
         if (active && graph.nodes.some(node => node.id === active)) this.view.focusId = active;
       }
       this.status = `${graph.stats.files} files · ${graph.relations.length} relations · ${graph.unresolved.length} unresolved · ${Math.round(graph.stats.elapsedMs)} ms`;
       this.publish();
-    } catch { if (run === this.running) this.error('Indexing failed. The previous graph is preserved; use Rebuild to retry.'); }
+      for (const branch of this.branches) void this.runBranch(branch);
+      if (this.pendingRestoredQuery) { const query = this.pendingRestoredQuery; this.pendingRestoredQuery = undefined; void this.startQuery(query); }
+    } catch { if (run === this.running) { this.index = { ...this.index, state: 'failed', reasonCodes: ['analysisFailed'] }; this.error('Indexing failed. The previous graph is preserved; use Rebuild to retry.'); } }
   }
 
   private async handle(message: UiMessage): Promise<void> {
     switch (message.type) {
-      case 'saveLocalState': await this.context.workspaceState.update('dependencyMap.uiState', message.state); return;
-      case 'ready': this.publish(); return;
+      case 'saveLocalState':
+        if (message.contextToken === this.uiStateToken) await this.context.workspaceState.update('dependencyMap.uiState', message.state);
+        return;
+      case 'ready':
+        this.runtime = { ...this.runtime, webview: message.build };
+        try { const installed = JSON.parse(await readFile(path.join(this.context.extensionPath, 'package.json'), 'utf8')); if (typeof installed.version === 'string') this.runtime = { ...this.runtime, installedVersion: installed.version.slice(0, 100) }; } catch { /* Running build identity remains authoritative. */ }
+        this.updateCompatibility(); this.publish(); return;
+      case 'startQuery': await this.startQuery(message.query); return;
+      case 'cancelQuery':
+        if (this.queries.active) this.client.cancelQuery(this.queries.active.requestId);
+        this.queries.cancel(); this.publish(); return;
+      case 'leaveAnalysis':
+        this.pendingRestoredQuery = undefined;
+        if (this.queries.active) this.client.cancelQuery(this.queries.active.requestId);
+        this.queries.clear();
+        if (this.exploreView) { this.view = this.exploreView; this.exploreView = undefined; }
+        this.publish(); return;
+      case 'branch': await this.changeBranch(message); return;
+      case 'gitState':
+        if (message.action === 'sourceControl') { await vscode.commands.executeCommand('workbench.view.scm'); return; }
+        this.observeGit(); this.publish();
+        if (message.action === 'impact') {
+          const seeds = [...new Set(this.git?.rows.filter(row => row.indexedNodeId && (!message.repoId || row.repoId === message.repoId)).map(row => row.indexedNodeId!) ?? [])];
+          if (!seeds.length) { this.error('Нет доступных индексированных файлов изменений. Удалённые и неизвестные файлы не означают нулевое влияние.'); return; }
+          if (seeds.length > 200) { this.error('Для одного запроса доступны 200 исходных файлов. Выберите отдельный репозиторий.'); return; }
+          await this.startQuery({ kind: 'impact', seeds, depth: 1, includeInferred: false, includeTypes: true }, this.git?.gitRevision);
+        }
+        return;
+      case 'taskContext': await this.handleTaskContext(message); return;
+      case 'diagnostics': await this.diagnostics(message.action); return;
       case 'rebuild': await this.rebuild(); return;
       case 'cancel':
         this.client.cancel(); this.running++;
         this.indexStale = true;
+        this.invalidateQueries('analysisCancelled'); this.index = { ...this.index, version: { ...this.index.version, epoch: randomUUID() }, state: 'cancelled', reasonCodes: ['analysisCancelled'] };
         if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
         this.status = 'Indexing cancelled. The displayed graph may be out of date.'; this.publish(); return;
       case 'setView':
         // Individual depths have their own commands; stale toolbar messages cannot replace them.
-        this.view = { ...message.view, nodeDepths: this.view.nodeDepths };
+        this.view = { ...message.view, nodeDepths: this.view.nodeDepths, ...(this.queries.active ? { focusId: this.view.focusId, follow: false } : {}) };
         if (this.view.follow) {
           const active = vscode.window.activeTextEditor?.document.uri;
           const id = active ? this.idForUri(active) : undefined;
@@ -269,6 +347,144 @@ export class WorkspaceSession implements vscode.Disposable {
         this.annotationQueue = this.annotationQueue.catch(() => {}).then(() => this.mutateAnnotations(message));
         await this.annotationQueue; return;
     }
+  }
+
+  private analytics(): AnalyticsState {
+    return { index: this.index, runtime: this.runtime, active: this.queries.active, branches: this.branches, git: this.git, taskContexts: this.taskContexts, uiStateToken: this.uiStateToken };
+  }
+
+  private updateCompatibility(): void {
+    const reasons: string[] = [];
+    if (!this.runtime.webview) reasons.push('legacyWebview');
+    else if (!compatibleBuild(this.runtime.webview)) reasons.push('webviewBuildMismatch');
+    if (this.runtime.worker && !compatibleBuild(this.runtime.worker)) reasons.push('workerBuildMismatch');
+    if (this.runtime.installedVersion !== buildInfo.extensionVersion) reasons.push('installedRunningVersionMismatch');
+    this.runtime = { ...this.runtime, compatible: reasons.length === 0, reasonCodes: reasons };
+    if (reasons.length) this.status = `Несовместимая или устаревшая карта: host ${buildInfo.extensionVersion}, Webview ${this.runtime.webview?.extensionVersion ?? 'legacy'}, пакет ${this.runtime.installedVersion}. Выполните Developer: Reload Window и откройте карту заново.`;
+    else if (this.status.startsWith('Несовместимая или устаревшая карта:')) this.status = this.indexStale ? 'Индекс требует пересчёта.' : 'Индекс актуален.';
+  }
+
+  private invalidateQueries(reason: string): void {
+    this.client.cancelQueries(); this.queries.invalidate(); this.branchRequests.clear();
+    this.branches = this.branches.map(branch => ({ ...branch, result: branch.result ? { ...branch.result, freshness: 'stale', reasonCodes: [...new Set([...branch.result.reasonCodes, reason])] } : undefined }));
+  }
+
+  private async startQuery(query: QuerySpec, gitRevision?: number): Promise<void> {
+    if (!this.runtime.compatible || !this.runtime.worker || !compatibleBuild(this.runtime.worker)) { this.error('Версии host, worker и карты должны совпадать. Перезагрузите окно и откройте карту.'); return; }
+    const previousRequestId = this.queries.active?.requestId;
+    const request = this.queries.start(query, this.index, this.graph, gitRevision);
+    if (!request) { this.error('Для запроса нужен актуальный индекс и существующие исходные файлы. Пересчитайте карту.'); return; }
+    this.pendingRestoredQuery = undefined;
+    if (previousRequestId) this.client.cancelQuery(previousRequestId);
+    if (!this.exploreView) this.exploreView = { ...this.view };
+    this.view = { ...this.view, follow: false };
+    this.publish();
+    const result = await this.client.query(request);
+    if (this.disposed) return;
+    if (result) this.queries.accept(result, this.index, this.git?.gitRevision);
+    else if (this.queries.active?.requestId === request.requestId && this.queries.active.state === 'running') this.queries.active = { ...this.queries.active, state: 'failed' };
+    this.publish();
+  }
+
+  private async changeBranch(message: Extract<UiMessage, { type: 'branch' }>): Promise<void> {
+    const existing = this.branches.find(branch => branch.anchorId === message.nodeId && branch.direction === message.direction);
+    const id = existing?.id ?? `branch:${createHash('sha256').update(JSON.stringify([message.nodeId, message.direction])).digest('hex').slice(0, 24)}`;
+    const pending = this.branchRequests.get(id); if (pending) this.client.cancelQuery(pending);
+    if (message.action === 'collapse') { this.branches = this.branches.filter(branch => branch.id !== id); this.branchRequests.delete(id); this.publish(); return; }
+    if (!this.runtime.compatible || this.index.state !== 'ready' || !this.graph.nodes.some(node => node.id === message.nodeId && node.file)) { this.error('Раскрытие доступно для файлов актуального индекса.'); return; }
+    if (!existing && this.branches.length >= 200) { this.error('Достигнут предел 200 раскрытых веток. Сверните ненужные ветки.'); return; }
+    const branch: BranchIntent = { id, anchorId: message.nodeId, direction: message.direction, depth: Math.min(20, (existing?.depth ?? 0) + 1), result: existing?.result };
+    this.view = { ...this.view, follow: false };
+    this.branches = [...this.branches.filter(item => item.id !== id), branch]; this.publish();
+    await this.runBranch(branch);
+  }
+
+  private async runBranch(branch: BranchIntent): Promise<void> {
+    if (!this.runtime.compatible || !this.runtime.worker || !compatibleBuild(this.runtime.worker) || this.index.state !== 'ready' || !this.graph.nodes.some(node => node.id === branch.anchorId && node.file)) return;
+    const requestId = randomUUID(), version = { ...this.index.version };
+    this.branchRequests.set(branch.id, requestId);
+    const result = await this.client.query({ type: 'query', apiVersion: 1, requestId, graph: version, limits: queryLimits, query: { kind: 'neighbourhood', anchorId: branch.anchorId, direction: branch.direction, depth: branch.depth } });
+    if (!result || this.disposed || this.index.state !== 'ready' || !sameIndex(result.graph, this.index.version) || this.branchRequests.get(branch.id) !== requestId) return;
+    this.branchRequests.delete(branch.id);
+    this.branches = this.branches.map(item => item.id === branch.id ? { ...item, result } : item); this.publish();
+  }
+
+  private observeGit(): void {
+    const previous = this.git?.gitRevision;
+    this.git = this.gitProvider.observe(this.roots, this.graph, vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file' && document.isDirty).map(document => document.uri.fsPath), { exclude: vscode.workspace.getConfiguration('dependencyMap').get<string[]>('exclude', defaultExclude) });
+    if (this.queries.active?.gitRevision !== undefined && previous !== this.git.gitRevision) {
+      this.client.cancelQuery(this.queries.active.requestId); this.queries.invalidate();
+    }
+  }
+
+  private contextStoreId(): string | undefined {
+    const root = this.roots.find(root => this.annotationPath && sameFilePath(path.join(root.path, '.vscode', 'dependency-map.json'), this.annotationPath));
+    return root ? `${root.id}:.vscode/dependency-map.json` : undefined;
+  }
+
+  private refreshTaskContexts(): void {
+    const store = this.contextStoreId();
+    try {
+      const entries = store ? this.taskStore.list(store) : [];
+      const groups = new Set(this.annotations?.groups.map(group => group.id) ?? []);
+      this.taskContexts = { ...this.taskContexts, savedGroupIds: entries.filter(entry => groups.has(entry.groupId)).map(entry => entry.groupId), orphanedGroupIds: entries.filter(entry => !groups.has(entry.groupId)).map(entry => entry.groupId) };
+    } catch { this.taskContexts = { ...this.taskContexts, message: 'Локальные контексты имеют неизвестную версию или повреждены. Данные сохранены без перезаписи.' }; }
+  }
+
+  private async handleTaskContext(message: Extract<UiMessage, { type: 'taskContext' }>): Promise<void> {
+    const storeId = this.contextStoreId();
+    if (!storeId) { this.taskContexts = { ...this.taskContexts, message: 'Сначала выберите существующую общую группу задачи.' }; this.publish(); return; }
+    try {
+      if (message.action === 'delete') {
+        await this.taskStore.remove(storeId, message.groupId);
+        this.taskContexts = { ...this.taskContexts, preview: undefined, restore: undefined, message: 'Локальная точка возврата удалена. Общая группа сохранена.' };
+      } else if (message.action === 'save') {
+        const group = this.annotations?.groups.find(group => group.id === message.groupId);
+        if (!group || !message.data) throw new Error('Missing group/context');
+        await this.taskStore.save(storeId, group.id, { ...message.data, view: { ...this.view }, query: this.queries.active?.query, branches: this.branches.map(({ result, ...intent }) => intent) }, fingerprintGroup(group));
+        this.taskContexts = { ...this.taskContexts, preview: undefined, restore: undefined, message: 'Точка возврата сохранена только в этом workspace. Общий JSON не изменён.' };
+      } else {
+        await this.refreshAnnotations();
+        const saved = this.taskStore.load(storeId, message.groupId);
+        if (!saved) throw new Error('Context missing');
+        const group = this.annotations?.groups.find(group => group.id === message.groupId);
+        const preview = previewTaskContext(saved, this.graph, fingerprintGroup(group), !group);
+        if (this.annotationError) preview.reasonCodes.push('sharedAnnotationsUnavailable');
+        const guard = JSON.stringify([storeId, message.groupId, fingerprintGroup(group), this.index.version, this.annotationError]);
+        if (message.action === 'preview' || !this.taskContexts.preview || this.taskPreviewGuard !== guard) {
+          this.taskPreviewGuard = guard;
+          this.taskContexts = { ...this.taskContexts, preview, restore: undefined, message: message.action === 'restore' ? 'Данные изменились. Проверьте обновлённый предпросмотр и повторите восстановление.' : 'Проверьте доступные ссылки перед восстановлением.' };
+        } else {
+          await this.context.workspaceState.update('dependencyMap.uiState', preview.data.ui);
+          this.uiStateToken = randomUUID();
+          if (this.queries.active) this.client.cancelQuery(this.queries.active.requestId);
+          this.client.cancelQueries(); this.queries.clear(); this.exploreView = undefined;
+          this.pendingRestoredQuery = undefined;
+          this.view = { ...preview.data.view, follow: false };
+          this.branches = preview.data.branches;
+          this.taskContexts = { ...this.taskContexts, preview: undefined, restore: { token: this.uiStateToken, data: preview.data }, message: 'Доступный контекст восстановлен; следование приостановлено. Недоступные ссылки сохранены.' };
+          this.publish();
+          for (const branch of this.branches) void this.runBranch(branch);
+          if (preview.data.query) {
+            if (this.index.state === 'ready' && querySeeds(preview.data.query).every(id => this.graph.nodes.some(node => node.id === id && node.file))) void this.startQuery(preview.data.query);
+            else { this.queries.active = { requestId: randomUUID(), query: preview.data.query, state: 'stale' }; this.pendingRestoredQuery = preview.data.query; }
+          }
+        }
+      }
+      this.refreshTaskContexts(); this.publish();
+    } catch { this.taskContexts = { ...this.taskContexts, message: 'Контекст не изменён: проверьте версию, доступность группы и лимит локального хранилища.' }; this.publish(); }
+  }
+
+  async diagnostics(action: 'preview' | 'copy' | 'reload' = 'preview'): Promise<void> {
+    if (action === 'reload') { await vscode.commands.executeCommand('workbench.action.reloadWindow'); return; }
+    if (action === 'preview') {
+      this.diagnosticPreview = formatDiagnostics({ runtime: this.runtime, index: this.index, graph: this.graph, git: this.git, active: this.queries.active });
+      if (this.panel.isReady()) this.panel.diagnostics(this.diagnosticPreview);
+      else {
+        const document = await vscode.workspace.openTextDocument({ language: 'json', content: this.diagnosticPreview });
+        await vscode.window.showTextDocument(document, { preview: true });
+      }
+    } else if (this.diagnosticPreview !== undefined) { await vscode.env.clipboard.writeText(this.diagnosticPreview); }
   }
 
   private async openNode(id: string, position?: { line: number; character: number }): Promise<void> {
@@ -350,6 +566,7 @@ export class WorkspaceSession implements vscode.Disposable {
       await this.validateAnnotationLocation(this.annotationPath);
       await this.annotationStore.save(updated);
       this.annotations = updated;
+      this.refreshTaskContexts();
       this.annotationError = undefined;
       if (creates) this.view.activeGroupId = groupId;
       this.publish();
@@ -361,7 +578,7 @@ export class WorkspaceSession implements vscode.Disposable {
     if (!this.annotationStore) return;
     try { if (this.annotationPath) await this.validateAnnotationLocation(this.annotationPath); this.annotations = await this.annotationStore.load(); this.annotationError = undefined; }
     catch { this.annotationError = 'Shared annotation file is invalid or unreadable. The last valid marks are displayed.'; }
-    this.publish();
+    this.refreshTaskContexts(); this.publish();
   }
 
   private async validateAnnotationLocation(file: string): Promise<void> {
@@ -377,7 +594,7 @@ export class WorkspaceSession implements vscode.Disposable {
 
   private publish(): void {
     if (this.disposed) return;
-    this.panel.update({ type: 'state', graph: this.graph, view: this.view, status: this.status, annotations: this.annotations, annotationError: this.annotationError });
+    this.panel.update({ type: 'state', graph: this.graph, view: this.view, status: this.status, annotations: this.annotations, annotationError: this.annotationError, analytics: this.analytics() });
     const view = JSON.stringify(this.view);
     if (view !== this.savedView) { this.savedView = view; void this.context.workspaceState.update('dependencyMap.view', this.view); }
   }
@@ -388,6 +605,7 @@ export class WorkspaceSession implements vscode.Disposable {
     this.disposed = true;
     if (this.timer) clearTimeout(this.timer);
     this.client.dispose(); this.panel.dispose();
+    this.gitProvider.dispose();
     for (const item of [...this.subscriptions, ...this.watchers]) item.dispose();
   }
 }

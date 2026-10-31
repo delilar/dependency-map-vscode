@@ -79,5 +79,6 @@ export class PanelLayout {
     }
   }
   state(): PanelSizes { return { ...this.sizes }; }
+  restore(sizes: PanelSizes | undefined): void { this.sizes = { ...sizes }; this.apply(); }
   destroy(): void { this.observer.disconnect(); cancelAnimationFrame(this.frame); }
 }

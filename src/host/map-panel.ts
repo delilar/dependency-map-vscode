@@ -2,13 +2,15 @@ import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import type { HostState, UiMessage, AnnotationResult } from '../shared/protocol';
 import { isUiMessage, isSavedUiState } from '../shared/protocol';
+import { compatibleBuild } from '../shared/build-info';
 
 export class MapPanel {
   private panel?: vscode.WebviewPanel;
   private ready = false;
+  private compatible = false;
   private latest?: HostState;
   private viewKey = '';
-  constructor(private readonly extensionUri: vscode.Uri, private readonly onMessage: (message: UiMessage) => void, private readonly getLocalState: () => unknown = () => undefined) {}
+  constructor(private readonly extensionUri: vscode.Uri, private readonly onMessage: (message: UiMessage) => void, private readonly getLocalState: () => unknown = () => undefined, private readonly onClose: () => void = () => {}) {}
 
   reveal(): void {
     if (this.panel) { this.panel.reveal(vscode.ViewColumn.Beside); return; }
@@ -26,10 +28,12 @@ export class MapPanel {
       if (!isUiMessage(value)) return;
       if (value.type === 'ready') {
         this.ready = true;
+        this.compatible = compatibleBuild(value.build);
+        this.onMessage(value);
         if (this.latest) void panel.webview.postMessage(this.latest);
-      } else this.onMessage(value);
+      } else if (this.compatible || ['openFile', 'openEvidence', 'diagnostics', 'rebuild', 'cancel'].includes(value.type)) this.onMessage(value);
     });
-    panel.onDidDispose(() => { messages.dispose(); this.panel = undefined; this.ready = false; });
+    panel.onDidDispose(() => { messages.dispose(); this.panel = undefined; this.ready = false; this.compatible = false; this.onClose(); });
   }
 
   update(state: HostState): void {
@@ -37,13 +41,14 @@ export class MapPanel {
     const statusOnly = this.latest?.graph === state.graph && this.viewKey === key && this.latest?.annotations === state.annotations && this.latest?.annotationError === state.annotationError;
     this.latest = state;
     this.viewKey = key;
-    if (this.panel && this.ready) void this.panel.webview.postMessage(statusOnly ? { type: 'status', status: state.status, revision: state.graph.revision } : state);
+    if (this.panel && this.ready) void this.panel.webview.postMessage(statusOnly ? { type: 'status', status: state.status, revision: state.graph.revision, analytics: state.analytics } : state);
   }
 
   dispose(): void { this.panel?.dispose(); }
   annotationResult(result: AnnotationResult): void {
     if (this.panel && this.ready) void this.panel.webview.postMessage(result);
   }
+  diagnostics(text: string): void { if (this.panel && this.ready) void this.panel.webview.postMessage({ type: 'diagnostics', text }); }
   isReady(): boolean { return this.ready; }
   isOpen(): boolean { return !!this.panel; }
 }
