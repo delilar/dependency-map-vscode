@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Dependency Map task annotations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "roots", "groups"],
+  "properties": {
+    "version": { "const": 1 },
+    "roots": {
+      "type": "array", "maxItems": 100000,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "label"],
+        "properties": { "id": { "$ref": "#/definitions/id" }, "label": { "$ref": "#/definitions/name" }, "packageName": { "type": "string", "minLength": 1, "maxLength": 1000 } }
+      }
+    },
+    "groups": {
+      "type": "array", "maxItems": 100000,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "name", "color", "files", "relations"],
+        "properties": {
+          "id": { "$ref": "#/definitions/id" }, "name": { "$ref": "#/definitions/name" },
+          "color": { "type": "string", "pattern": "^#[a-fA-F0-9]{6}$" },
+          "files": {
+            "type": "array", "maxItems": 100000,
+            "items": { "type": "object", "additionalProperties": false, "required": ["file"], "properties": { "file": { "$ref": "#/definitions/file" }, "note": { "$ref": "#/definitions/note" } } }
+          },
+          "relations": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/definitions/relation" } }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\s/\\\\:]+$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "note": { "type": "string", "maxLength": 10000 },
+    "file": {
+      "type": "object", "additionalProperties": false, "required": ["rootId", "path"],
+      "properties": {
+        "rootId": { "$ref": "#/definitions/id" },
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^(?!/)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)[^\\\\:\\u0000-\\u001f]+$" }
+      }
+    },
+    "external": {
+      "type": "object", "additionalProperties": false, "required": ["packageName", "projectId"],
+      "properties": { "packageName": { "type": "string", "minLength": 1, "maxLength": 1000 }, "projectId": { "type": "string", "minLength": 1, "maxLength": 4096 } }
+    },
+    "relation": {
+      "type": "object", "additionalProperties": false, "required": ["source", "target", "kind"],
+      "properties": {
+        "source": { "$ref": "#/definitions/file" },
+        "target": { "oneOf": [{ "$ref": "#/definitions/file" }, { "$ref": "#/definitions/external" }] },
+        "kind": { "enum": ["import", "reexport", "resource", "config", "framework", "environment"] },
+        "specifier": { "type": "string", "maxLength": 4096 },
+        "note": { "$ref": "#/definitions/note" }
+      }
+    }
+  }
+}

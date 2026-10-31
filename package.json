@@ -1,0 +1,127 @@
+{
+  "name": "dependency-map-vscode",
+  "displayName": "Dependency Map",
+  "description": "Explore file dependencies and annotate task groups in frontend workspaces.",
+  "version": "0.1.2",
+  "publisher": "local-tools",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/delilar/dependency-map-vscode.git"
+  },
+  "homepage": "https://github.com/delilar/dependency-map-vscode#readme",
+  "bugs": {
+    "url": "https://github.com/delilar/dependency-map-vscode/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.2"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "main": "./dist/extension.cjs",
+  "activationEvents": [
+    "onCommand:dependencyMap.openFile",
+    "onCommand:dependencyMap.openProject"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "dependencyMap.openFile",
+        "title": "Dependency Map: Open File Map",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "dependencyMap.openProject",
+        "title": "Dependency Map: Open Project Map"
+      },
+      {
+        "command": "dependencyMap.rebuild",
+        "title": "Dependency Map: Rebuild Index"
+      },
+      {
+        "command": "dependencyMap.bindRoots",
+        "title": "Dependency Map: Bind Shared Roots"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "dependencyMap.openFile",
+          "when": "resourceScheme == file",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Dependency Map",
+      "properties": {
+        "dependencyMap.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".git",
+            "dist",
+            "build",
+            "coverage",
+            ".next",
+            ".nuxt",
+            ".output",
+            ".cache",
+            ".turbo"
+          ],
+          "description": "Directory names or root-relative paths to exclude. node_modules is always excluded."
+        }
+      }
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": "**/.vscode/dependency-map.json",
+        "url": "./schemas/dependency-map.schema.json"
+      }
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test.mjs",
+    "test:integration": "node scripts/run-integration.mjs",
+    "test:persistence": "npm run build && node scripts/test-persistence.mjs",
+    "test:ui": "npm run build && node scripts/ui-smoke.mjs && node scripts/ui-fixes.mjs",
+    "benchmark:ui": "npm run build && node scripts/ui-benchmark.mjs",
+    "benchmark": "node scripts/benchmark.mjs",
+    "render:project": "npm run build && node scripts/render-project.mjs",
+    "check": "npm run typecheck && npm test && npm run build",
+    "vscode:prepublish": "npm run build",
+    "package": "npm run check && vsce package --no-dependencies --no-rewrite-relative-links"
+  },
+  "dependencies": {
+    "cytoscape": "3.34.4",
+    "minimatch": "9.0.9",
+    "parse5": "7.3.0",
+    "postcss": "8.5.32",
+    "postcss-less": "6.0.0",
+    "postcss-scss": "4.0.9",
+    "postcss-value-parser": "4.2.0",
+    "sass-parser": "0.5.1",
+    "stylus": "0.64.0",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "sass-parser": {
+      "postcss": "$postcss"
+    }
+  },
+  "devDependencies": {
+    "@types/cytoscape": "^3.21.9",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "1.85.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "0.28.2",
+    "playwright": "1.64.1"
+  }
+}

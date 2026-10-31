@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.test-dist/
+.vscode-test/
+artifacts/
+output/
+tmp/
+docs/
+AGENTS.md
+.codex/
+*.vsix
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db

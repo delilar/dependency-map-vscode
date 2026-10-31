@@ -1,0 +1,35 @@
+const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
+const indentedSassAvailable = nodeMajor > 20 || (nodeMajor === 20 && nodeMinor >= 19);
+
+export const formatCapabilities: Record<string, { mode: 'references' | 'keys-only' | 'node-only'; detail: string }> = {
+  '.js': { mode: 'references', detail: 'TypeScript AST imports, exports, literal require/import, static assets and framework declarations' },
+  '.jsx': { mode: 'references', detail: 'JavaScript plus literal JSX resource attributes' },
+  '.ts': { mode: 'references', detail: 'JavaScript plus type-only imports/exports and import-equals' },
+  '.tsx': { mode: 'references', detail: 'TypeScript plus literal JSX resource attributes' },
+  '.mjs': { mode: 'references', detail: 'JavaScript ESM' },
+  '.cjs': { mode: 'references', detail: 'Literal require; CommonJS export assignment navigation is not implemented' },
+  '.mts': { mode: 'references', detail: 'TypeScript ESM' },
+  '.cts': { mode: 'references', detail: 'TypeScript CommonJS imports' },
+  '.css': { mode: 'references', detail: 'PostCSS imports and url()' },
+  '.scss': { mode: 'references', detail: 'SCSS import/use/forward and url(); static paths and partials' },
+  '.html': { mode: 'references', detail: 'parse5 literal src/href/poster resources' },
+  '.htm': { mode: 'references', detail: 'HTML resource references' },
+  '.env': { mode: 'keys-only', detail: 'Variable names and locations; values excluded' },
+  '.json': { mode: 'node-only', detail: 'Incoming imports; known package/tsconfig fields have dedicated rules' },
+  '.jsonc': { mode: 'node-only', detail: 'Incoming imports; arbitrary data strings are not interpreted as paths' },
+  '.yaml': { mode: 'node-only', detail: 'Incoming references only' },
+  '.yml': { mode: 'node-only', detail: 'Incoming references only' },
+  '.toml': { mode: 'node-only', detail: 'Incoming references only' },
+  '.xml': { mode: 'node-only', detail: 'Incoming references only' },
+  '.csv': { mode: 'node-only', detail: 'Incoming references only' },
+  '.sass': { mode: indentedSassAvailable ? 'references' : 'node-only', detail: 'Official Sass parse-only AST: use/forward/import/url; requires Node 20.19+; computed paths stay unresolved; parser syntax subset is experimental' },
+  '.less': { mode: 'references', detail: 'postcss-less parse-only imports (including options) and url(); variables/interpolation stay unresolved' },
+  '.styl': { mode: 'references', detail: 'Stylus parse-only imports/require/url; unquoted paths may be inferred, bound variables stay unresolved; no evaluation' },
+  '.vue': { mode: 'node-only', detail: 'Component analyzer deferred' },
+  '.svelte': { mode: 'node-only', detail: 'Component analyzer deferred' },
+  '.astro': { mode: 'node-only', detail: 'Component analyzer deferred' },
+  '.md': { mode: 'node-only', detail: 'Incoming references only' },
+  '.mdx': { mode: 'node-only', detail: 'MDX internal-reference parser is not implemented' },
+  '.graphql': { mode: 'node-only', detail: 'GraphQL document imports are not implemented' },
+  '.gql': { mode: 'node-only', detail: 'GraphQL document imports are not implemented' }
+};
