@@ -67,9 +67,11 @@ try {
   await page.getByRole('button', { name: 'B.ts', exact: true }).click();
   await page.getByRole('button', { name: 'Ещё исходящие', exact: true }).click();
   await page.waitForFunction(() => window.sent.some(m => m.type === 'branch' && m.direction === 'outgoing'));
+  await page.getByRole('button', { name: 'C.ts', exact: true }).waitFor();
   assert(await page.getByRole('button', { name: 'C.ts', exact: true }).count(), 'Directed branch contributes C to A radius 1');
   await page.getByRole('button', { name: 'Свернуть исходящую ветку', exact: true }).click();
   await page.waitForFunction(() => !window.harness.state.analytics.branches.length);
+  await page.getByRole('button', { name: 'C.ts', exact: true }).waitFor({ state: 'detached' });
   assert.equal(await page.getByRole('button', { name: 'C.ts', exact: true }).count(), 0);
   await page.getByLabel('Формат', { exact: true }).selectOption('.ts');
   await page.getByRole('button', { name: 'Кто может зависеть от изменения', exact: true }).click();

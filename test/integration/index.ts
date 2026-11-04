@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as assert from 'node:assert/strict';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import { Worker } from 'node:worker_threads';
 import type { HostState, SavedUiState, UiMessage } from '../../src/shared/protocol';
 import type { WorkspaceRoot } from '../../src/shared/model';
 import type { AnnotationsDocument } from '../../src/host/annotations';
@@ -34,6 +35,19 @@ export async function run(): Promise<void> {
   assert.ok(extension, 'development extension must be installed');
   const activationStarted = performance.now();
   await extension.activate();
+  if (process.env.DEPENDENCY_MAP_TEST_ACTIVATION !== '1' && process.env.DEPENDENCY_MAP_TEST_RESTORE !== '1') {
+    const worker = new Worker(path.join(extension.extensionPath, 'dist', 'worker.cjs'));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Packaged worker startup timed out')), 10000);
+        worker.once('error', error => { clearTimeout(timer); reject(error); });
+        worker.once('message', message => {
+          clearTimeout(timer);
+          try { assert.equal(message.type, 'workerReady'); resolve(); } catch (error) { reject(error); }
+        });
+      });
+    } finally { await worker.terminate(); }
+  }
   if (process.env.DEPENDENCY_MAP_TEST_ACTIVATION === '1') {
     const activationMs = performance.now() - activationStarted;
     const idle = await inspect();
