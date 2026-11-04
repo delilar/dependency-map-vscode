@@ -136,7 +136,7 @@ exports.activate=async context=>{
     }
     const resultFile = path.join(temporary, `${phase}.json`);
     await new Promise((resolve, reject) => {
-      const child = spawn(executable, [workspace, '--disable-gpu', '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--skip-add-to-recently-opened', '--extensionDevelopmentPath', extension, '--user-data-dir', path.join(temporary, 'profile'), '--extensions-dir', path.join(temporary, 'extensions')], {
+      const child = spawn(executable, [workspace, '--no-sandbox', '--disable-gpu-sandbox', '--disable-updates', '--disable-gpu', '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--skip-add-to-recently-opened', '--extensionDevelopmentPath', extension, '--user-data-dir', path.join(temporary, 'profile'), '--extensions-dir', path.join(temporary, 'extensions')], {
         env: { ...process.env, DEPENDENCY_MAP_TEST: '1', DEPENDENCY_MAP_PHASE: phase, DEPENDENCY_MAP_RESULT: resultFile }, windowsHide: true, stdio: 'inherit'
       });
       const timeout = setTimeout(() => { child.kill(); reject(new Error(`Persistence ${phase} timed out`)); }, 55000);

@@ -25,6 +25,16 @@ async function waitFor(predicate: (state: Inspection) => boolean, label: string)
   throw new Error(`Timed out: ${label}; status=${state.status}; index=${state.analytics?.index.state}; active=${state.analytics?.active?.state}; reasons=${state.analytics?.active?.result?.reasonCodes.join(',') ?? ''}; scope=${JSON.stringify(state.view.queryScope)}`);
 }
 
+async function settledIndex(label: string): Promise<Inspection> {
+  let signature = '', changedAt = Date.now();
+  // Wait across two 350ms watcher debounce windows after preview closes and fixture writes.
+  return waitFor(state => {
+    const current = JSON.stringify(state.analytics?.index);
+    if (current !== signature) { signature = current; changedAt = Date.now(); }
+    return state.analytics?.index.state === 'ready' && state.analytics.runtime.compatible && Date.now() - changedAt >= 800;
+  }, label);
+}
+
 export async function run(): Promise<void> {
   const fixture = process.env.DEPENDENCY_MAP_TEST_WORKSPACE;
   assert.ok(fixture, 'runner must provide its isolated temporary workspace');
@@ -170,7 +180,7 @@ export async function run(): Promise<void> {
   const markedGroup = state.annotations?.groups.find(item => item.id === group.id);
   assert.equal(markedGroup?.files[0].note, 'Check API');
   assert.equal(markedGroup?.relations[0].note, 'Check API');
-  state = await waitFor(value => value.analytics?.index.state === 'ready', 'query index ready');
+  state = await settledIndex('settled query index after navigation and annotation writes');
   await dispatch({ type: 'startQuery', query: { kind: 'impact', seeds: [value.id], depth: 3, includeInferred: false, includeTypes: true } });
   state = await waitFor(value => value.analytics?.active?.state === 'ready', 'real worker impact query');
   assert.equal(state.view.follow, false, 'analytics atomically pauses editor following');
@@ -190,7 +200,7 @@ export async function run(): Promise<void> {
   assert.equal((await inspect()).analytics?.active?.requestId, previousRequest, 'mismatched Webview cannot launch queries');
   await dispatch({ type: 'ready', build: runningBuild });
   await dispatch({ type: 'leaveAnalysis' });
-  await waitFor(snapshot => snapshot.analytics?.index.state === 'ready' && snapshot.analytics.runtime.compatible, 'sendable index before branch query');
+  await settledIndex('settled sendable index before branch query');
   await dispatch({ type: 'branch', nodeId: value.id, direction: 'incoming', action: 'expand' });
   assert.equal((await inspect()).analytics?.branches[0]?.anchorId, value.id, 'the branch intent must start before waiting for its result');
   state = await waitFor(snapshot => !!snapshot.analytics?.branches[0]?.result, 'real branch query');
