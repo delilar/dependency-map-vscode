@@ -90,6 +90,8 @@ try {
   await page.getByLabel('Куда', { exact: true }).selectOption(await page.evaluate(() => window.harness.ids[1]));
   await page.getByRole('button', { name: 'Найти направленный путь', exact: true }).click();
   await page.waitForFunction(() => window.harness.state.analytics.active.query.kind === 'path');
+  await page.locator('.query-summary').filter({ hasText: 'Путь импортов' }).waitFor();
+  await page.locator('.query-results').filter({ hasText: 'A.ts' }).waitFor();
   assert((await page.locator('.query-results').textContent()).includes('A.ts'), 'Path lists actual files');
   await page.getByRole('button', { name: 'Вернуться к обычной карте', exact: true }).click();
   await page.getByRole('button', { name: 'B.ts', exact: true }).click();
@@ -158,6 +160,7 @@ try {
   await page.waitForFunction(() => document.querySelector('.graph')._cyreg.cy.nodes().length === 500);
   assert(await page.getByText('Предел карты — 500 файлов. Часть ветки скрыта ограничением отображения, независимо от полноты запроса.', { exact: true }).count());
   await page.evaluate(() => window.harness.mismatch());
+  await page.waitForFunction(() => Array.from(document.querySelectorAll('button')).some(node => node.textContent === 'Оценить влияние выбранного файла' && node.disabled));
   assert(await page.getByRole('button', { name: 'Оценить влияние выбранного файла', exact: true }).isDisabled());
   assert.deepEqual(errors, []);
   console.log('Analytics UI passed: branches, full-index hidden test/evidence, stale/repeat, directed path, symbol ambiguity, cached Git, draft-safe task restore, diagnostics preview, handshake and responsive layouts.');

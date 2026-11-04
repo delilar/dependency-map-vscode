@@ -190,7 +190,9 @@ export async function run(): Promise<void> {
   assert.equal((await inspect()).analytics?.active?.requestId, previousRequest, 'mismatched Webview cannot launch queries');
   await dispatch({ type: 'ready', build: runningBuild });
   await dispatch({ type: 'leaveAnalysis' });
+  await waitFor(snapshot => snapshot.analytics?.index.state === 'ready' && snapshot.analytics.runtime.compatible, 'sendable index before branch query');
   await dispatch({ type: 'branch', nodeId: value.id, direction: 'incoming', action: 'expand' });
+  assert.equal((await inspect()).analytics?.branches[0]?.anchorId, value.id, 'the branch intent must start before waiting for its result');
   state = await waitFor(snapshot => !!snapshot.analytics?.branches[0]?.result, 'real branch query');
   assert.ok(state.analytics!.branches[0].result!.nodeIds.includes(main.id));
   const scopeRevision = state.graph.revision;
