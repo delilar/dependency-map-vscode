@@ -4,5 +4,10 @@
 !LICENSE
 !THIRD_PARTY_NOTICES.md
 !SECURITY.md
-!dist/**
+!dist/*.cjs
+!dist/*.js
+!dist/*.css
+!dist/*.json
+!dist/parsers/**/*.cjs
+!dist/parsers/*.wasm
 !schemas/**

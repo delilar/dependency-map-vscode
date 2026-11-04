@@ -2,6 +2,7 @@ import { Worker } from 'node:worker_threads';
 import type { AnalyzeRequest, WorkerReply } from '../shared/protocol';
 import type { GraphSnapshot } from '../shared/model';
 import { sameIndex, type BuildIdentity, type QueryRequest, type QueryResult } from '../shared/query-model';
+import { scopeSignature } from '../shared/scope';
 
 interface PendingAnalysis {
   generation: number;
@@ -36,7 +37,7 @@ export class AnalysisClient {
       if (reply.type === 'workerReady') { this.onWorkerReady(reply.build); return; }
       if (reply.type === 'queryResult') {
         const query = this.queries.get(reply.requestId);
-        if (!query || !sameIndex(query.request.graph, reply.graph)) return;
+        if (!query || !sameIndex(query.request.graph, reply.graph) || (reply.queryScopeSignature ?? 'all') !== scopeSignature(query.request.scope)) return;
         this.queries.delete(reply.requestId); query.resolve(reply); return;
       }
       const pending = this.pending;

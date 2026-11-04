@@ -29,8 +29,9 @@ export class GraphQueryIndex {
     if (graph.diagnostics.some(item => !item.fileId)) this.baseReasons.add('configurationDiagnostic');
     this.incomingReasons = this.scopedReasons(this.nodes.keys());
   }
-  reasons(scope: Iterable<string>, incoming: boolean): string[] {
-    return incoming ? this.incomingReasons : this.scopedReasons(scope);
+  reasons(scope: Iterable<string>, incoming: boolean, includeFramework = false): string[] {
+    const reasons = incoming ? this.incomingReasons : this.scopedReasons(scope);
+    return includeFramework ? reasons : reasons.filter(reason => !['frameworkLimited', 'frameworkScopeBoundary'].includes(reason));
   }
   private scopedReasons(scope: Iterable<string>): string[] {
     const reasons = new Set(this.baseReasons);
@@ -40,7 +41,7 @@ export class GraphQueryIndex {
       if (!coverage) reasons.add('coverageUnavailable');
       else {
         if (coverage.status === 'failed' || coverage.status === 'skipped') for (const reason of coverage.reasonCodes) reasons.add(reason);
-        for (const reason of coverage.reasonCodes) if (['parseDiagnostic', 'configurationDiagnostic', 'unsupportedInternalReferences', 'formatUnavailable', 'unresolvedReference'].includes(reason)) reasons.add(reason);
+        for (const reason of coverage.reasonCodes) if (['parseDiagnostic', 'configurationDiagnostic', 'unsupportedInternalReferences', 'formatUnavailable', 'unresolvedReference', 'frameworkLimited'].includes(reason)) reasons.add(reason);
       }
       if (this.unresolved.has(id)) reasons.add('unresolvedReference');
     }

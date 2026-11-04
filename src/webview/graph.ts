@@ -3,6 +3,7 @@ import type { GraphNode, GraphSnapshot, Relation, ViewState } from '../shared/mo
 import { isTestRole } from '../shared/roles';
 import { collectNeighbourhood } from './depth';
 import type { GraphAppearance } from './appearance';
+import { inScope, scopedGraph } from '../shared/scope';
 
 export interface ProjectedEdge { id: string; sourceId: string; targetId: string; relations: Relation[]; collapsed: boolean }
 export interface Projection { nodes: GraphNode[]; edges: ProjectedEdge[] }
@@ -103,6 +104,7 @@ function collapseEdges(graph: GraphSnapshot, protectedIds: Set<string>): Project
 }
 
 export function projectGraph(graph: GraphSnapshot, view: ViewState, options: ProjectionOptions = {}): Projection {
+  graph = scopedGraph(graph, view.queryScope);
   const forced = options.forcedIds ?? new Set<string>();
   const folder = (options.folder ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   const protectedIds = new Set(forced);
@@ -124,6 +126,7 @@ export function projectGraph(graph: GraphSnapshot, view: ViewState, options: Pro
   for (const id of options.branchNodeIds ?? []) if (eligible.has(id)) protectedIds.add(id);
   for (const id of options.queryNodeIds ?? []) if (eligible.has(id)) protectedIds.add(id);
   for (const id of Object.keys(view.nodeDepths ?? {})) if (eligible.has(id)) protectedIds.add(id);
+  if (view.presentationScope) eligible = new Set([...eligible].filter(id => forced.has(id) || inScope(graph.nodes.find(node => node.id === id), view.presentationScope)));
   const subset = { ...graph, nodes: graph.nodes.filter(node => eligible.has(node.id)), relations: graph.relations.filter(edge => eligible.has(edge.sourceId) && eligible.has(edge.targetId)
     && (!options.queryRelationIds || options.queryRelationIds.has(edge.id) || options.branchRelationIds?.has(edge.id))) };
   return view.collapseReexports ? collapseEdges(subset, protectedIds) : { nodes: subset.nodes, edges: subset.relations.map(edge => ({ id: edge.id, sourceId: edge.sourceId,
@@ -216,21 +219,24 @@ export class GraphCanvas {
   private applyTheme(): void {
     const styles = getComputedStyle(document.body);
     const token = (name: string, fallback: string) => styles.getPropertyValue(`--vscode-${name}`).trim() || fallback;
+    const configuredFont = parseFloat(token('font-size', '13px'));
+    const fontScale = Number.isFinite(configuredFont) && configuredFont > 0 ? configuredFont / 13 : 1;
     this.cy.style([
       { selector: 'node', style: { 'background-color': token('button-background', '#3979b7'), 'border-color': token('contrastBorder', '#607080'),
-        'border-width': 1, label: 'data(label)', color: token('editor-foreground', '#d6dce5'), 'font-size': 11,
+        'border-width': 1, label: 'data(label)', color: token('editor-foreground', '#d6dce5'), 'font-size': 11 * fontScale,
         'text-wrap': 'ellipsis', 'text-max-width': '170px', 'text-valign': 'bottom', 'text-margin-y': 7, width: 23, height: 23 } },
       { selector: 'node[external]', style: { shape: 'diamond', 'background-color': token('disabledForeground', '#7d8590') } },
       { selector: 'node[group]', style: { shape: 'roundrectangle', 'background-opacity': 0.07, 'background-color': token('editor-foreground', '#d6dce5'),
-        'border-style': 'dashed', 'text-valign': 'top', 'font-size': 12, padding: '24px' } },
-      { selector: 'node[?collapsedGroup]', style: { 'background-opacity': 0.18, width: 60, height: 40, 'text-valign': 'center', 'text-wrap': 'wrap', 'text-max-width': '140px', 'font-size': 10 } },
+        'border-style': 'dashed', 'text-valign': 'top', 'font-size': 12 * fontScale, padding: '24px' } },
+      { selector: 'node[?collapsedGroup]', style: { 'background-opacity': 0.18, width: 60, height: 40, 'text-valign': 'center', 'text-wrap': 'wrap', 'text-max-width': '140px', 'font-size': 10 * fontScale } },
       { selector: 'node[?focus]', style: { 'outline-width': 2, 'outline-color': token('focusBorder', '#00b7ff'), 'outline-offset': 3, width: 31, height: 31 } },
       { selector: 'node[fill]', style: { 'background-color': 'data(fill)' } },
       { selector: 'node[border]', style: { 'border-color': 'data(border)', 'border-width': 4 } },
       { selector: 'node[folderColor]', style: { 'background-color': 'data(folderColor)' } },
       { selector: 'edge', style: { width: 1.1, 'line-color': token('descriptionForeground', '#788897'), 'target-arrow-color': token('descriptionForeground', '#788897'),
         'target-arrow-shape': 'triangle', 'curve-style': 'bezier', opacity: 0.7, 'arrow-scale': 0.7 } },
-      { selector: 'edge[inferred], edge[collapsed]', style: { 'line-style': 'dashed' } },
+      { selector: 'edge[inferred]', style: { 'line-style': 'dashed' } },
+      { selector: 'edge[collapsed]', style: { label: 'data(aggregation)', 'font-size': 9 * fontScale, 'text-background-opacity': 0.8, 'text-background-color': token('editor-background', '#1e1e1e') } },
       { selector: 'edge[color]', style: { 'line-color': 'data(color)', 'target-arrow-color': 'data(color)', width: 2.5 } },
       { selector: '.search-match', style: { 'text-background-color': token('editor-findMatchHighlightBackground', '#806c00'), 'text-background-opacity': 0.45, 'text-background-padding': '3px' } },
       { selector: ':selected', style: { 'underlay-color': token('focusBorder', '#00b7ff'), 'underlay-opacity': 0.3, 'underlay-padding': 6, opacity: 1 } }
@@ -268,25 +274,26 @@ export class GraphCanvas {
     const labels = displayLabels(projection.nodes);
     const elements: ElementDefinition[] = [];
     for (const group of projection.groups) {
+      const mark = appearance.folderMarks.get(group.id);
       const members = group.memberIds.map(id => positions[id]).filter(Boolean);
       const position = positions[group.id] ?? (members.length ? {
         x: members.reduce((sum, item) => sum + item.x, 0) / members.length,
         y: members.reduce((sum, item) => sum + item.y, 0) / members.length
       } : undefined);
-      elements.push({ data: { id: group.id, label: `${group.label} (${group.memberIds.length})${group.collapsed ? ' ▸' : ''}`,
+      elements.push({ data: { id: group.id, label: `${group.label} (${group.memberIds.length})${mark?.marked ? ` · задача ${mark.marked}/${mark.total}${mark.marked === mark.total ? ' все' : ' часть'}` : ''}${group.collapsed ? ' ▸' : ''}`,
         group: true, collapsedGroup: group.collapsed, folderColor: appearance.folderColors.get(group.id),
-        border: group.memberIds.map(id => appearance.nodeBorders.get(id)).find(Boolean) }, position });
+        border: mark?.total && mark.marked === mark.total ? group.memberIds.map(id => appearance.nodeBorders.get(id)).find(Boolean) : undefined }, position });
     }
     for (const node of projection.nodes) {
       const parent = projection.parents[node.id];
       const localDepth = view.nodeDepths?.[node.id];
-      elements.push({ data: { id: node.id, label: `${labels.get(node.id)}${localDepth ? ` · ${localDepth} ур.` : ''}`, path: node.file?.path ?? node.packageName ?? node.label, parent, external: node.kind === 'external' ? true : undefined,
+      elements.push({ data: { id: node.id, label: `${labels.get(node.id)}${view.colorPreset !== 'format' && node.languageId ? ` [${node.languageId}]` : ''}${localDepth ? ` · ${localDepth} ур.` : ''}`, path: node.file?.path ?? node.packageName ?? node.label, parent, external: node.kind === 'external' ? true : undefined,
         focus: node.id === view.focusId, fill: appearance.nodeFills.get(node.id), border: appearance.nodeBorders.get(node.id) }, position: positions[node.id], classes: matches.has(node.id) ? 'search-match' : '' });
     }
     this.edges = new Map(projection.edges.map(edge => [edge.id, edge]));
     for (const edge of projection.edges) elements.push({ data: { id: edge.id, source: edge.sourceId, target: edge.targetId,
       inferred: edge.relations.some(item => item.certainty === 'inferred') ? true : undefined,
-      collapsed: edge.collapsed ? true : undefined, color: edge.relations.map(item => appearance.edgeColors.get(item.id)).find(Boolean) } });
+      collapsed: edge.collapsed ? true : undefined, aggregation: `×${edge.relations.length}`, color: edge.relations.map(item => appearance.edgeColors.get(item.id)).find(Boolean) } });
     this.cy.batch(() => {
       const desired = new Set(elements.map(item => item.data.id!));
       this.cy.edges().filter(edge => !desired.has(edge.id())).remove();

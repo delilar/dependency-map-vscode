@@ -1,5 +1,6 @@
 import type { FileRef, GraphSnapshot, RelationKind, SourceRange, ViewState } from './model';
 import type { SavedUiState } from './protocol';
+import { isScopeSpec, scopeSignature, type ScopeSpec } from './scope';
 
 export interface IndexVersion { epoch: string; revision: number; scopeRevision: number }
 export interface IndexState {
@@ -9,6 +10,7 @@ export interface IndexState {
 export interface FileCoverage {
   fileId: string; status: 'parsed' | 'nodeOnly' | 'skipped' | 'failed';
   reasonCodes: string[]; unresolvedCount: number;
+  symbols?: 'available' | 'limited' | 'unavailable';
 }
 export type SymbolNamespace = 'type' | 'value' | 'both';
 export interface ExportEntry {
@@ -26,13 +28,14 @@ export interface ExportResolution {
 export type QuerySpec =
   | { kind: 'impact'; seeds: string[]; depth: number; includeInferred: boolean; includeTypes: boolean }
   | { kind: 'neighbourhood'; anchorId: string; direction: 'incoming' | 'outgoing'; depth: number }
-  | { kind: 'path'; fromId: string; toId: string }
+  | { kind: 'path'; fromId: string; toId: string; mode?: 'imports' | 'all'; includeInferred?: boolean }
   | { kind: 'symbol'; fileId: string; exported: string; namespace: SymbolNamespace };
 export interface EffectiveQueryLimits { maxNodes: number; maxRelations: number; deadlineMs: number }
 export const queryLimits: EffectiveQueryLimits = { maxNodes: 10000, maxRelations: 50000, deadlineMs: 1500 };
 export interface QueryRequest {
   type: 'query'; apiVersion: 1; requestId: string; graph: IndexVersion; query: QuerySpec;
   limits: EffectiveQueryLimits; gitRevision?: number;
+  scope?: ScopeSpec; queryScopeSignature?: string;
 }
 export interface EvidencePath { nodeId: string; nodeIds: string[]; relationIds: string[]; depth: number }
 interface QueryResultBase {
@@ -41,6 +44,7 @@ interface QueryResultBase {
   freshness: 'current' | 'stale'; reasonCodes: string[]; limits: EffectiveQueryLimits;
   visitedNodes: number; examinedRelations: number; nodeIds: string[]; relationIds: string[];
   witnesses: EvidencePath[]; gitRevision?: number;
+  queryScopeSignature?: string;
 }
 export type QueryResult = QueryResultBase & (
   | { kind: 'impact'; outcome: 'found' | 'notFoundWithinScope' | 'notFoundWithinLimits' | 'unknown'; directIds: string[]; indirectIds: string[]; testIds: string[] }
@@ -49,7 +53,7 @@ export type QueryResult = QueryResultBase & (
   | { kind: 'symbol'; outcome: 'resolved' | 'ambiguous' | 'unresolved' | 'unsupported'; resolution: ExportResolution }
 );
 export interface BranchIntent { id: string; anchorId: string; direction: 'incoming' | 'outgoing'; depth: number; result?: QueryResult }
-export interface ActiveQuery { requestId: string; query: QuerySpec; state: 'running' | 'ready' | 'cancelled' | 'failed' | 'stale'; result?: QueryResult; previousResult?: QueryResult; gitRevision?: number }
+export interface ActiveQuery { requestId: string; query: QuerySpec; state: 'running' | 'ready' | 'cancelled' | 'failed' | 'stale'; result?: QueryResult; previousResult?: QueryResult; gitRevision?: number; queryScopeSignature?: string }
 export interface BuildIdentity { extensionVersion: string; buildId: string; protocolVersion: number; capabilities: string[] }
 export interface RuntimeState {
   host: BuildIdentity; worker?: BuildIdentity; webview?: BuildIdentity; installedVersion: string;
@@ -96,7 +100,8 @@ export function isQuerySpec(v: unknown): v is QuerySpec {
   switch (v.kind) {
     case 'impact': return keys(v, ['kind', 'seeds', 'depth', 'includeInferred', 'includeTypes']) && ids(v.seeds) && v.seeds.length > 0 && depth(v.depth) && typeof v.includeInferred === 'boolean' && typeof v.includeTypes === 'boolean';
     case 'neighbourhood': return keys(v, ['kind', 'anchorId', 'direction', 'depth']) && id(v.anchorId) && ['incoming', 'outgoing'].includes(String(v.direction)) && depth(v.depth);
-    case 'path': return keys(v, ['kind', 'fromId', 'toId']) && id(v.fromId) && id(v.toId);
+    case 'path': return keys(v, ['kind', 'fromId', 'toId', 'mode', 'includeInferred']) && id(v.fromId) && id(v.toId)
+      && (v.mode === undefined || ['imports', 'all'].includes(String(v.mode))) && (v.includeInferred === undefined || typeof v.includeInferred === 'boolean');
     case 'symbol': return keys(v, ['kind', 'fileId', 'exported', 'namespace']) && id(v.fileId) && id(v.exported) && v.exported.length <= 1000 && ['type', 'value', 'both'].includes(String(v.namespace));
     default: return false;
   }
@@ -107,12 +112,14 @@ export function querySeeds(q: QuerySpec): string[] {
 export function isQueryRequest(v: unknown): v is QueryRequest {
   if (!record(v) || !record(v.graph) || !record(v.limits)) return false;
   const graph = v.graph, limits = v.limits;
-  return keys(v, ['type', 'apiVersion', 'requestId', 'graph', 'query', 'limits', 'gitRevision']) && v.type === 'query' && v.apiVersion === 1 && id(v.requestId) && v.requestId.length <= 200
+  return keys(v, ['type', 'apiVersion', 'requestId', 'graph', 'query', 'limits', 'gitRevision', 'scope', 'queryScopeSignature']) && v.type === 'query' && v.apiVersion === 1 && id(v.requestId) && v.requestId.length <= 200
     && keys(graph, ['epoch', 'revision', 'scopeRevision']) && id(graph.epoch)
     && ['revision', 'scopeRevision'].every(k => Number.isSafeInteger(graph[k]) && Number(graph[k]) >= 0)
     && isQuerySpec(v.query) && keys(limits, ['maxNodes', 'maxRelations', 'deadlineMs'])
     && Object.entries(queryLimits).every(([k, cap]) => Number.isInteger(limits[k]) && Number(limits[k]) > 0 && Number(limits[k]) <= cap)
-    && (v.gitRevision === undefined || Number.isSafeInteger(v.gitRevision) && Number(v.gitRevision) >= 0);
+    && (v.gitRevision === undefined || Number.isSafeInteger(v.gitRevision) && Number(v.gitRevision) >= 0)
+    && (v.scope === undefined || isScopeSpec(v.scope))
+    && (v.queryScopeSignature === undefined || typeof v.queryScopeSignature === 'string' && v.queryScopeSignature === scopeSignature(v.scope as ScopeSpec | undefined));
 }
 export function graphHasQuerySeeds(graph: GraphSnapshot, query: QuerySpec): boolean {
   return querySeeds(query).every(id => graph.nodes.some(n => n.id === id && n.file));

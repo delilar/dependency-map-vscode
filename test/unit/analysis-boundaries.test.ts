@@ -66,7 +66,8 @@ test('coverage distinguishes parsed, node-only, unreadable and oversized files a
     let graph = await session.analyze(roots, { exclude: [] }, []);
     const coverage = (name: string) => graph.coverage?.find(item => item.fileId === graph.nodes.find(node => node.file?.path === name)?.id);
     assert.equal(coverage('entry.ts')?.status, 'parsed');
-    assert.equal(coverage('view.vue')?.status, 'nodeOnly');
+    assert.equal(coverage('view.vue')?.status, 'parsed');
+    assert(coverage('view.vue')?.reasonCodes.includes('unresolvedReference'));
     assert.equal(coverage('picture.png')?.status, 'nodeOnly');
     assert.equal(coverage('unreadable.ts')?.status, 'failed');
     assert(coverage('unreadable.ts')?.reasonCodes.includes('readFailed'));

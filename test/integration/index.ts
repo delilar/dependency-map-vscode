@@ -21,7 +21,7 @@ async function waitFor(predicate: (state: Inspection) => boolean, label: string)
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   const state = await inspect();
-  throw new Error(`Timed out: ${label}; status=${state.status}`);
+  throw new Error(`Timed out: ${label}; status=${state.status}; index=${state.analytics?.index.state}; active=${state.analytics?.active?.state}; reasons=${state.analytics?.active?.result?.reasonCodes.join(',') ?? ''}; scope=${JSON.stringify(state.view.queryScope)}`);
 }
 
 export async function run(): Promise<void> {
@@ -32,7 +32,17 @@ export async function run(): Promise<void> {
   const marksPath = path.join(fixture, 'web', '.vscode', 'dependency-map.json');
   const extension = vscode.extensions.getExtension('local-tools.dependency-map-vscode');
   assert.ok(extension, 'development extension must be installed');
+  const activationStarted = performance.now();
   await extension.activate();
+  if (process.env.DEPENDENCY_MAP_TEST_ACTIVATION === '1') {
+    const activationMs = performance.now() - activationStarted;
+    const idle = await inspect();
+    assert.equal(idle.graph.revision, 0, 'activation alone must not index the workspace');
+    assert.equal(idle.panelReady, false, 'activation alone must not open a Webview');
+    assert.equal(idle.analytics?.runtime.worker, undefined, 'activation alone must not initialize analyzer parsers');
+    console.log(`Dependency Map activation sample: ${JSON.stringify({ version: extension.packageJSON.version, host: vscode.version, node: process.versions.node, activationMs, rssMiB: Math.round(process.memoryUsage().rss / 1048576) })}`);
+    return;
+  }
   if (process.env.DEPENDENCY_MAP_TEST_RESTORE === '1') {
     const before = await fs.readFile(marksPath, 'utf8');
     await vscode.commands.executeCommand('dependencyMap.openProject');
@@ -98,9 +108,18 @@ export async function run(): Promise<void> {
   }
   const sass = state.graph.nodes.find(node => node.file?.path === 'src/styles.sass');
   assert.ok(sass);
-  const runtime = process.versions.node.split('.').map(Number);
-  if (runtime[0] > 20 || runtime[0] === 20 && runtime[1] >= 19) assert.ok(state.graph.relations.some(edge => edge.sourceId === sass.id && edge.kind === 'resource'), 'Sass parser works on the supported runtime');
-  else assert.ok(state.graph.diagnostics.some(item => item.fileId === sass.id), 'Old Node runtime explicitly reports Sass parser limitation');
+  assert.ok(state.graph.relations.some(edge => edge.sourceId === sass.id && edge.kind === 'resource'), 'Bundled Sass parser works in the minimum extension host');
+  for (const name of ['Card.vue', 'Widget.svelte', 'Home.astro', 'guide.mdx']) {
+    const file = state.graph.nodes.find(node => node.file?.path === `src/${name}`);
+    assert.ok(file && state.graph.coverage?.some(row => row.fileId === file.id && row.status === 'parsed'), `${name} parser loads in the actual packaged worker`);
+    assert.ok(state.graph.relations.some(edge => edge.sourceId === file.id), `${name} has real outgoing references`);
+  }
+  const fileId = (file: string) => state.graph.nodes.find(node => node.file?.path === `src/${file}`)?.id;
+  assert.ok(state.graph.relations.some(edge => edge.sourceId === fileId('NgPage.html') && edge.targetId === fileId('NgCard.ts') && edge.kind === 'framework'), 'Angular compiler loads and proves a scoped selector in the packaged worker');
+  assert.ok(state.graph.relations.some(edge => edge.sourceId === fileId('query.graphql') && edge.targetId === fileId('fragment.graphql')), 'GraphQL parser loads and links fragments in the packaged worker');
+  const vue = state.graph.nodes.find(node => node.file?.path === 'src/Card.vue')!;
+  const componentBarrel = state.graph.relations.find(edge => edge.specifier === './Card.vue' && edge.kind === 'reexport')!;
+  assert.ok(state.graph.declarations?.some(item => item.relationId === componentBarrel.id && item.file.path === vue.file?.path), 'cross-format default export navigation survives the worker boundary');
   const declaration = state.graph.declarations?.find(item => item.relationId === initialRelation.id && item.imported === 'value');
   assert.ok(declaration, 'syntactic declaration was resolved');
   await dispatch({ type: 'openDeclaration', relationId: initialRelation.id, imported: 'value' });
@@ -160,7 +179,28 @@ export async function run(): Promise<void> {
   await dispatch({ type: 'branch', nodeId: value.id, direction: 'incoming', action: 'expand' });
   state = await waitFor(snapshot => !!snapshot.analytics?.branches[0]?.result, 'real branch query');
   assert.ok(state.analytics!.branches[0].result!.nodeIds.includes(main.id));
+  const scopeRevision = state.graph.revision;
+  const onlyValue = { version: 1 as const, folders: [{ rootId: 'test-web', path: 'src/value.ts' }], excludeRoles: [] };
+  await dispatch({ type: 'setView', view: { ...state.view, queryScope: onlyValue } });
+  state = await inspect();
+  assert.equal(state.graph.revision, scopeRevision, 'changing analytical scope does not reparse source');
+  assert.equal(state.analytics?.branches[0]?.result?.freshness, 'stale', 'a previous full-scope branch is fenced after Q changes');
+  await dispatch({ type: 'branch', nodeId: value.id, direction: 'incoming', action: 'expand' });
+  state = await waitFor(snapshot => snapshot.analytics?.branches[0]?.result?.freshness === 'current', 'scoped real worker branch');
+  assert.deepEqual(state.analytics?.branches[0]?.result?.nodeIds, [value.id], 'strict Q removes the outside importer despite saved local depths');
   await dispatch({ type: 'startQuery', query: { kind: 'path', fromId: main.id, toId: value.id } });
+  assert.equal((await inspect()).analytics?.active, undefined, 'a seed outside Q cannot start an analytical query');
+  await dispatch({ type: 'openFile', nodeId: main.id });
+  assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, mainUri.fsPath, 'outside-Q search target remains openable');
+  assert.deepEqual((await inspect()).view.queryScope, onlyValue, 'opening an outside file never expands Q');
+  state = await inspect();
+  await dispatch({ type: 'setView', view: { ...state.view, queryScope: undefined } });
+  await dispatch({ type: 'branch', nodeId: value.id, direction: 'incoming', action: 'expand' });
+  state = await waitFor(snapshot => snapshot.analytics?.branches[0]?.result?.freshness === 'current', 'unrestricted branch after explicit scope reset');
+  assert.ok(state.analytics!.branches[0].result!.nodeIds.includes(main.id));
+  state = await waitFor(snapshot => snapshot.analytics?.index.state === 'ready' && snapshot.analytics.runtime.compatible, 'sendable index before context query');
+  await dispatch({ type: 'startQuery', query: { kind: 'path', fromId: main.id, toId: value.id } });
+  assert.equal((await inspect()).analytics?.active?.query.kind, 'path', 'the context query must start before waiting for its result');
   state = await waitFor(snapshot => snapshot.analytics?.active?.state === 'ready', 'context query before manual save');
   const sharedBeforeContext = await fs.readFile(marksPath, 'utf8');
   await dispatch({ type: 'taskContext', action: 'save', groupId: group.id, data: { view: state.view, ui: { canvas: { zoom: 1.2 } }, branches: [], selection: { nodeIds: [main.id], relationIds: [initialRelation.id] } } });

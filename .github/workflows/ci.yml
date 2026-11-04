@@ -1,4 +1,4 @@
-name: Build and test
+name: Build and verify extension
 
 on:
   push:
@@ -25,3 +25,75 @@ jobs:
         run: npm ci
       - name: Check, build and package
         run: npm run package
+      - name: Probe bundled parsers
+        run: npm run probe:parsers
+      - name: Save checked VSIX
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: checked-vsix
+          path: |
+            *.vsix
+            *.vsix.sha256
+          if-no-files-found: error
+
+  ui:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run test:ui
+      - name: Save UI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui-evidence
+          path: artifacts/
+          if-no-files-found: ignore
+
+  desktop:
+    needs: package
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        vscode: ['1.85.2', '1.143.1']
+    env:
+      VSCODE_VERSION: ${{ matrix.vscode }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Download checked archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: checked-vsix
+      - name: Test installed VSIX and restart
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          npm run test:installed 2>&1 | Tee-Object -FilePath artifacts/installed.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify archive matches checkout
+        run: npm run verify:package
+      - name: Check migration, normal restart and archived-version rollback
+        if: matrix.vscode == '1.85.2'
+        shell: pwsh
+        run: |
+          npm run test:rollback 2>&1 | Tee-Object -FilePath artifacts/persistence.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Save desktop evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-${{ matrix.vscode }}
+          path: artifacts/
+          if-no-files-found: ignore

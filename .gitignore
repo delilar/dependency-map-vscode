@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .test-dist/
+.test-dist-*/
 .vscode-test/
 artifacts/
 output/
@@ -9,6 +10,7 @@ docs/
 AGENTS.md
 .codex/
 *.vsix
+*.vsix.sha256
 *.log
 .env
 .env.*

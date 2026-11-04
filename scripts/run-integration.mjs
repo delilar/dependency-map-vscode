@@ -23,11 +23,22 @@ async function file(root, relative, content) {
   await writeFile(destination, content);
 }
 try {
-  await file(web, 'package.json', JSON.stringify({ name: 'integration-web', private: true }));
+  await file(web, 'package.json', JSON.stringify({ name: 'integration-web', private: true, dependencies: { '@angular/core': '21.0.0' }, dependencyMap: { graphqlDocuments: ['src/*.graphql'] } }));
   await file(web, 'tsconfig.json', JSON.stringify({ compilerOptions: { moduleResolution: 'node', baseUrl: '.', paths: { '@/*': ['src/*'] }, resolveJsonModule: true } }));
   await file(web, 'src/main.ts', 'import { value } from "@/value";\nimport "./styles.css";\nimport "./styles.less";\nimport "./styles.styl";\nimport "./styles.sass";\nimport data from "./data.json";\nexport const result = value + data.n;\nexport const api = process.env.API_URL;\n');
   await file(web, 'src/value.ts', 'export const value = 1;\n');
   await file(web, 'src/changed.ts', 'export const changed = 2;\n');
+  await file(web, 'src/Card.vue', '<script setup lang="ts">import {value} from "./value";</script><template><div/></template>');
+  await file(web, 'src/Widget.svelte', '<script>import {value} from "./value";</script><div/>');
+  await file(web, 'src/Home.astro', '---\nimport Card from "./Card.vue";\n---\n<Card/>');
+  await file(web, 'src/guide.mdx', 'import Card from "./Card.vue";\n\n# Guide\n\n<Card/>');
+  await file(web, 'src/components.ts', 'export {default as Card} from "./Card.vue";');
+  await file(web, 'src/web-stack.ts', 'import {Card} from "./components"; import Widget from "./Widget.svelte"; import Home from "./Home.astro"; import Guide from "./guide.mdx";');
+  await file(web, 'src/NgCard.ts', 'import {Component} from "@angular/core"; @Component({selector:"app-card",template:"<div/>"}) export class NgCard {}');
+  await file(web, 'src/NgPage.ts', 'import {Component} from "@angular/core"; import {NgCard} from "./NgCard"; @Component({imports:[NgCard],templateUrl:"./NgPage.html"}) export class NgPage {}');
+  await file(web, 'src/NgPage.html', '<app-card/>');
+  await file(web, 'src/query.graphql', 'query Q {user {...User}}');
+  await file(web, 'src/fragment.graphql', 'fragment User on User {id}');
   await file(web, 'src/styles.css', '.example { color: red; }\n');
   await file(web, 'src/styles.less', '@import "./palette.less"; .example { color: @accent; }\n');
   await file(web, 'src/palette.less', '@accent: #eab308;\n');
@@ -54,12 +65,12 @@ try {
   await file(web, 'src/value.ts', 'export const value = 1;\n// Unstaged test fixture change.\n');
   await writeFile(workspace, JSON.stringify({ folders: [{ name: 'web', path: web }, { name: 'child', path: child }], settings: { 'security.workspace.trust.enabled': false, 'workbench.startupEditor': 'none' } }));
   let extensionPath = project;
-  if (process.env.DEPENDENCY_MAP_TEST_PACKAGE === '1') {
+  if (process.argv.includes('--installed') || process.env.DEPENDENCY_MAP_TEST_PACKAGE === '1') {
     const manifest = JSON.parse(await readFile(path.join(project, 'package.json'), 'utf8'));
-    const packagePath = path.join(project, `${manifest.name}-${manifest.version}.vsix`);
+    const packagePath = process.env.DEPENDENCY_MAP_TEST_PACKAGE_PATH ?? path.join(project, `${manifest.name}-${manifest.version}.vsix`);
     const installed = await runVSCodeCommand(['--install-extension', packagePath, '--force', '--user-data-dir', path.join(temporary, 'profile'), '--extensions-dir', path.join(temporary, 'extensions')], { version: process.env.VSCODE_VERSION ?? 'stable', reuseMachineInstall: false });
     console.log(installed.stdout.trim());
-    const folder = (await readdir(path.join(temporary, 'extensions'))).find(name => name === `${manifest.publisher}.${manifest.name}-${manifest.version}`);
+    const folder = (await readdir(path.join(temporary, 'extensions'))).find(name => name.startsWith(`${manifest.publisher}.${manifest.name}-`));
     assert.ok(folder, 'packaged extension must install into the isolated extensions folder');
     extensionPath = path.join(temporary, 'extensions', folder);
   }
@@ -67,12 +78,20 @@ try {
     extensionDevelopmentPath: extensionPath,
     extensionTestsPath: testEntry,
     ...(process.env.VSCODE_EXECUTABLE_PATH ? { vscodeExecutablePath: process.env.VSCODE_EXECUTABLE_PATH } : { version: process.env.VSCODE_VERSION ?? 'stable' }),
-    extensionTestsEnv: { DEPENDENCY_MAP_TEST: '1', DEPENDENCY_MAP_TEST_WORKSPACE: temporary },
+    extensionTestsEnv: { DEPENDENCY_MAP_TEST: '1', DEPENDENCY_MAP_TEST_WORKSPACE: temporary, ...(process.env.DEPENDENCY_MAP_TEST_ACTIVATION === '1' ? { DEPENDENCY_MAP_TEST_ACTIVATION: '1' } : {}) },
     reuseMachineInstall: false,
     launchArgs: [workspace, '--disable-gpu', '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--skip-add-to-recently-opened', '--user-data-dir', path.join(temporary, 'profile'), '--extensions-dir', path.join(temporary, 'extensions')]
   };
-  await runTests(options);
-  await runTests({ ...options, extensionTestsEnv: { ...options.extensionTestsEnv, DEPENDENCY_MAP_TEST_RESTORE: '1' } });
+  if (process.env.DEPENDENCY_MAP_TEST_ACTIVATION === '1') {
+    for (let sample = 0; sample < 10; sample++) {
+      const args = [...options.launchArgs];
+      args[args.indexOf('--user-data-dir') + 1] = path.join(temporary, `activation-profile-${sample}`);
+      await runTests({ ...options, launchArgs: args });
+    }
+  } else {
+    await runTests(options);
+    await runTests({ ...options, extensionTestsEnv: { ...options.extensionTestsEnv, DEPENDENCY_MAP_TEST_RESTORE: '1' } });
+  }
 } finally {
   const relative = path.relative(os.tmpdir(), temporary);
   assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative) && path.basename(temporary).startsWith('dependency-map-integration-'));

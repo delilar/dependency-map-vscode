@@ -9,6 +9,8 @@ import { createGraphAppearance, groupFilterIds, type AnnotationGroup, type Annot
 import { AnalysisWorkbench, chooseDraftAction } from './analysis-workbench';
 import { buildInfo } from '../shared/build-info';
 import type { TaskContextData } from '../shared/query-model';
+import { inScope, isScopeSpec, normalizeScope, scopeSignature, type ScopeSpec } from '../shared/scope';
+import { describeScope } from './scope-description';
 
 declare global { interface Window { __dependencyMapInitialState?: SavedUiState } }
 declare function acquireVsCodeApi(): { postMessage(message: UiMessage): void; getState(): SavedUiState | undefined; setState(value: SavedUiState): void };
@@ -35,6 +37,10 @@ let restoredContextToken = '';
 let pendingNoteSave: { requestId: string; resolve(ok: boolean): void; timer: ReturnType<typeof setTimeout> } | undefined;
 let draftTransition = false;
 let retainedSelectionIds = new Set<string>();
+const noteDrafts = new Map<string, typeof noteDraft>();
+let canvasSelection: CanvasSelection | undefined;
+let canvasSelectionQueued = false;
+let relationLimit = 100;
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text = ''): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
@@ -95,15 +101,17 @@ const mode = select([['file', 'Текущий файл'], ['project', 'Весь 
 const follow = checkbox('Следовать за редактором', false, value => updateView({ follow: value }));
 const depth = select(Array.from({ length: 20 }, (_, i) => [String(i + 1), String(i + 1)]), value => updateView({ depth: Number(value) }));
 const grouping = select([['none', 'Без группировки'], ['folder', 'По папкам'], ['project', 'По приложениям']], value => updateView({ groupBy: value as ViewState['groupBy'] }));
+const colorPreset = select([['family', 'Цвета семейств'], ['format', 'Цвета форматов']], value => updateView({ colorPreset: value as 'family' | 'format' }));
 const resetDepths = button('Сбросить локальные', () => api.postMessage({ type: 'resetNodeDepths' }));
-toolbar.append(label('Режим', mode), follow.label, label('Общая глубина', depth), label('Группировка', grouping), resetDepths,
-  button('Пересчитать', () => api.postMessage({ type: 'rebuild' })), button('Отмена', () => api.postMessage({ type: 'cancel' })));
+const rebuildButton = button('Пересчитать', () => api.postMessage({ type: 'rebuild' }));
+const cancelIndex = button('Остановить индексацию', () => api.postMessage({ type: 'cancel' }));
+toolbar.append(label('Режим', mode), follow.label, label('Общая глубина', depth), label('Группировка', grouping), resetDepths, rebuildButton, cancelIndex);
 const content = element('div', 'workspace');
 const sidebar = element('aside', 'sidebar'); sidebar.setAttribute('aria-label', 'Поиск и фильтры');
 const searchInput = element('input'); searchInput.type = 'search'; searchInput.placeholder = 'Файл, путь или импортируемое имя'; searchInput.value = saved.query ?? ''; searchInput.setAttribute('aria-label', 'Поиск по всему индексу');
 searchInput.addEventListener('input', () => renderProjection());
 const external = checkbox('Внешние пакеты', false, value => updateView({ hideExternal: !value }));
-const tests = checkbox('Тесты и fixtures', true, value => updateView({ hideTests: !value }));
+const tests = checkbox('Тестовые файлы и данные (test, mock, fixture)', true, value => updateView({ hideTests: !value }));
 const collapsed = checkbox('Свернуть реэкспорты', false, value => updateView({ collapseReexports: value }));
 const direction = select([['both', 'В обе стороны'], ['incoming', 'Кто импортирует'], ['outgoing', 'Что импортируется']], changeFilters); direction.value = saved.direction ?? 'both';
 const format = select([['', 'Все форматы']], changeFilters);
@@ -117,70 +125,138 @@ const results = element('div', 'results'); results.setAttribute('role', 'list');
 const groupList = element('div', 'map-groups'); groupList.setAttribute('aria-label', 'Сворачивание областей карты');
 const filtersPanel = element('section', 'panel-upper');
 const resultsPanel = element('section', 'panel-lower');
-filtersPanel.append(label('Поиск во всём проекте', searchInput), element('p', 'hint', 'Поиск включает файлы, скрытые фильтрами.'),
-  label('Направление', direction), label('Формат', format), label('Приложение', project), label('Роль файла', role), label('Папка (от корня)', folder), external.label, tests.label, collapsed.label,
-  groupOnly.label);
+filtersPanel.append(label('Поиск во всём проекте', searchInput), element('p', 'hint', 'Поиск включает файлы, скрытые фильтрами.'), label('Направление', direction));
+const advancedFilters = element('details', 'advanced-filters'); advancedFilters.append(element('summary', '', 'Фильтры и оформление'),
+  label('Формат', format), label('Приложение', project), label('Роль файла', role), label('Папка (от корня)', folder), external.label, tests.label, collapsed.label, groupOnly.label);
+filtersPanel.append(advancedFilters);
+const scopeControls = element('details', 'scope-controls'); scopeControls.append(element('summary', '', 'Области вида V и анализа Q'));
+type ScopeKind = 'queryScope' | 'presentationScope';
+let scopeEditorKey = '';
+const scopeTarget = select([['queryScope', 'Учитывать при анализе (Q)'], ['presentationScope', 'Показывать на карте (V)']], () => hydrateScopeEditor(true));
+const scopeRoot = select([], () => hydrateScopeEditor(true));
+const scopePaths = element('textarea'); scopePaths.rows = 2; scopePaths.placeholder = 'src/features/cart\nsrc/shared';
+const scopeTests = checkbox('Исключить роль test', false, () => {});
+const scopeMocks = checkbox('Исключить роль mock', false, () => {});
+const scopeFixtures = checkbox('Исключить роль fixture', false, () => {});
+const scopeAdd = checkbox('Добавить папки, сохранив текущие исключения', false, () => {});
+const scopeStatus = element('p', 'hint'); scopeStatus.setAttribute('aria-live', 'polite');
+function hydrateScopeEditor(force = false): void {
+  const scope = state.view[scopeTarget.value as ScopeKind];
+  if (!scopeRoot.value) scopeRoot.value = scope?.folders[0]?.rootId ?? state.graph.nodes.find(node => node.file)?.file?.rootId ?? '';
+  const key = JSON.stringify([scopeTarget.value, scopeRoot.value, scope]);
+  if (!force && key === scopeEditorKey) return;
+  scopeEditorKey = key;
+  scopePaths.value = scope?.folders.filter(folder => folder.rootId === scopeRoot.value).map(folder => folder.path).join('\n') ?? '.';
+  scopeTests.input.checked = scope?.excludeRoles.includes('test') ?? false;
+  scopeMocks.input.checked = scope?.excludeRoles.includes('mock') ?? false;
+  scopeFixtures.input.checked = scope?.excludeRoles.includes('fixture') ?? false;
+  scopeAdd.input.checked = false;
+}
+function applyScope(kind: ScopeKind): void {
+  const previous = state.view[kind];
+  const value: ScopeSpec = { version: 1, folders: [...(previous?.folders.filter(folder => folder.rootId !== scopeRoot.value) ?? []), ...scopePaths.value.split(/\r?\n/).map(path => path.trim().replace(/\\/g, '/').replace(/\/$/, '')).filter(Boolean).map(path => ({ rootId: scopeRoot.value, path }))],
+    excludeRoles: [scopeTests.input.checked ? 'test' : '', scopeMocks.input.checked ? 'mock' : '', scopeFixtures.input.checked ? 'fixture' : ''].filter(Boolean) };
+  if (scopeAdd.input.checked && previous) { value.folders.unshift(...previous.folders); value.excludeRoles.push(...previous.excludeRoles); }
+  if (!isScopeSpec(value)) { scopeStatus.textContent = 'Укажите корень и относительные папки, по одной на строку. Точка означает весь корень; выход через .. запрещён.'; return; }
+  forcedIds.clear(); retainedSelectionIds.clear(); updateView({ [kind]: normalizeScope(value) });
+}
+scopeControls.append(element('p', 'hint', 'Показ на карте скрывает файлы визуально. Область анализа ограничивает пути и поиск зависимостей; внешний промежуточный файл не проходит границу. Изменения применяются кнопкой.'),
+  label('Редактируемая область', scopeTarget), label('Корень области', scopeRoot), label('Папки (по одной на строку)', scopePaths), scopeTests.label, scopeMocks.label, scopeFixtures.label, scopeAdd.label,
+  button('Папка выбранного файла', () => { const node = state.graph.nodes.find(node => selected.nodeIds.includes(node.id) && node.file); if (node?.file) { scopeRoot.value = node.file.rootId; scopePaths.value = node.file.path.includes('/') ? node.file.path.slice(0, node.file.path.lastIndexOf('/')) : '.'; } }),
+  button('Применить область', () => applyScope(scopeTarget.value as ScopeKind)),
+  button('Сбросить показ (V)', () => updateView({ presentationScope: undefined })), button('Сбросить анализ (Q)', () => updateView({ queryScope: undefined })), scopeStatus);
+filtersPanel.append(scopeControls);
+advancedFilters.append(label('Цветовая схема', colorPreset), element('p', 'hint', 'Семейства: CODE — код · UI — компоненты/разметка · STYLE — стили · DATA — данные/документы · CFG — конфиги · RES — ресурсы. Язык указан в подписи, задача — отдельной отметкой.'));
 resultsPanel.append(groupList, resultSummary, results, element('p', 'hint', 'Enter — открыть, пробел — выбрать, Shift+F10 — глубина узла.'));
 
 const stage = element('section', 'stage'); stage.setAttribute('aria-label', 'Граф зависимостей');
 const stageToolbar = element('div', 'stage-toolbar');
 const graphSummary = element('span', 'small');
+const focusSummary = element('p', 'focus-summary'); focusSummary.setAttribute('role', 'status');
 const canvasElement = element('div', 'graph'); canvasElement.setAttribute('aria-label', 'Визуальный граф. Для клавиатуры используйте список файлов слева.');
 const empty = element('div', 'empty');
-const legend = element('div', 'legend', 'Стрелка: импортирующий → импортируемый · Пунктир: предположение или свёрнутая связь · Двойной клик по области: свернуть/раскрыть · Ctrl/⌘: несколько элементов');
+const legend = element('div', 'legend', 'Стрелка: импортирующий → импортируемый · Пунктир: предположение · ×N: свёрнутая цепочка/группа связей · Двойной клик по области: свернуть/раскрыть · Ctrl/⌘: несколько элементов');
 const expandDepth = button('Общая глубина +1', () => updateView({ depth: Math.min(20, state.view.depth + 1) }));
 stageToolbar.append(button('−', () => canvas.zoomBy(1 / 1.25), 'Уменьшить масштаб'), button('+', () => canvas.zoomBy(1.25), 'Увеличить масштаб'),
   button('Вписать', () => canvas.center()), button('Раскладка', () => canvas.layout(state.view.mode)), expandDepth, graphSummary);
-stage.append(stageToolbar, canvasElement, empty, legend);
+stage.append(stageToolbar, focusSummary, canvasElement, empty, legend);
 
 const inspector = element('aside', 'inspector'); inspector.setAttribute('aria-label', 'Детали и группы задач');
-const tasksPanel = element('section', 'panel-upper');
-const detailsPanel = element('section', 'panel-lower');
+const tasksPanel = element('section', 'panel-lower tasks-panel'); tasksPanel.tabIndex = -1;
+const detailsPanel = element('section', 'panel-upper details-panel'); detailsPanel.tabIndex = -1;
 const groupControls = createGroupControls({ activateGroup: id => { void resolveDrafts().then(ok => { if (ok) updateView({ activeGroupId: id }); else renderDetails(); }); }, command: command => api.postMessage({ type: 'annotation', ...command }) });
 const selectionSummary = element('p', 'small');
 const showColors = checkbox('Показывать цвета задач', showGroupColors, value => { showGroupColors = value; renderProjection(); persist(); });
 const note = element('textarea'); note.rows = 3; note.maxLength = 10000; note.placeholder = 'Заметка к выбранному файлу или связи';
-note.addEventListener('input', () => { noteDraft.text = note.value; noteDraft.dirty = true; });
+note.addEventListener('input', () => { noteDraft.text = note.value; noteDraft.dirty = true; updateNoteFeedback(); });
 const saveNote = button('Сохранить заметку', () => {
   if (pendingNote) return;
   const requestId = `note-${Date.now().toString(36)}-${++noteSequence}`;
-  pendingNote = { requestId, key: noteDraft.key }; saveNote.disabled = true;
+  pendingNote = { requestId, key: noteDraft.key }; saveNote.disabled = true; updateNoteFeedback();
   annotation('note', { note: noteDraft.text, requestId });
 });
 const noteHint = element('p', 'hint');
+noteHint.setAttribute('role', 'status');
+const recoverNotes = button('Несохранённые заметки', () => {
+  const dialog = element('dialog', 'review-dialog'); dialog.setAttribute('aria-label', 'Сохранённые черновики заметок');
+  dialog.append(element('h2', '', 'Черновики к недоступным элементам'), element('p', 'hint', 'Текст сохранён в этой вкладке. Вернитесь к элементу для сохранения или скопируйте его перед закрытием.'));
+  for (const draft of noteDrafts.values()) if (draft.dirty) { const text = element('textarea'); text.readOnly = true; text.rows = 4; text.value = draft.text; text.setAttribute('aria-label', 'Текст несохранённой заметки'); dialog.append(text); }
+  dialog.append(button('Закрыть', () => dialog.close())); dialog.addEventListener('close', () => dialog.remove(), { once: true }); document.body.append(dialog); dialog.showModal();
+});
 const groupError = element('p', 'error'); groupError.setAttribute('role', 'alert');
 const groupAvailability = element('p', 'hint'); groupAvailability.setAttribute('aria-live', 'polite');
 const details = element('section', 'details'); details.setAttribute('aria-live', 'polite');
 const problems = element('details', 'problems'); const problemSummary = element('summary', '', 'Диагностика'); const problemList = element('div'); problems.append(problemSummary, problemList);
-tasksPanel.append(groupControls.element, showColors.label, selectionSummary, label('Заметка', note), saveNote, noteHint, groupError, groupAvailability);
+tasksPanel.append(groupControls.element, showColors.label, selectionSummary, label('Заметка', note), saveNote, noteHint, recoverNotes, groupError, groupAvailability);
 detailsPanel.append(details, problems);
 const status = element('footer', 'status'); status.setAttribute('role', 'status');
 shell.append(toolbar, content, status); document.body.append(shell);
 panels = new PanelLayout(shell, content, saved.panelSizes, persist);
-sidebar.append(filtersPanel, panels.handles.leftTop, resultsPanel); inspector.append(tasksPanel, panels.handles.rightTop, detailsPanel);
+sidebar.append(filtersPanel, panels.handles.leftTop, resultsPanel); inspector.append(detailsPanel, panels.handles.rightTop, tasksPanel);
+panels.handles.rightTop.setAttribute('aria-label', 'Высота деталей');
 content.append(sidebar, panels.handles.left, stage, panels.handles.right, inspector, panels.handles.narrowCanvas);
+content.dataset.pane = 'list';
+const paneNavigation = element('nav', 'pane-navigation'); paneNavigation.setAttribute('aria-label', 'Разделы узкой карты');
+for (const [pane, text] of [['list', 'Поиск'], ['details', 'Детали'], ['task', 'Задача']] as const) {
+  const control = button(text, () => showPane(pane, true)); control.dataset.pane = pane; control.setAttribute('aria-pressed', String(pane === 'list')); paneNavigation.append(control);
+}
+stage.append(paneNavigation);
+function showPane(pane: 'list' | 'details' | 'task', focus = false): void {
+  content.dataset.pane = pane;
+  paneNavigation.querySelectorAll<HTMLButtonElement>('button').forEach(control => control.setAttribute('aria-pressed', String(control.dataset.pane === pane)));
+  if (focus && window.matchMedia('(max-width: 759px)').matches) {
+    const target = pane === 'list' ? searchInput : pane === 'details' ? detailsPanel : tasksPanel;
+    target.focus({ preventScroll: true });
+  }
+}
 shell.insertBefore(panels.handles.toolbar, content);
 const depthMenu = new NodeDepthMenu((nodeId, value) => api.postMessage({ type: 'setNodeDepth', nodeId, depth: value }),
   (nodeId, direction, action) => api.postMessage({ type: 'branch', nodeId, direction, action }));
 document.body.append(depthMenu.element);
 
 const canvas = new GraphCanvas(canvasElement, {
-  open: nodeId => api.postMessage({ type: 'openFile', nodeId }),
+  open: nodeId => { void changeSelection({ nodeIds: [nodeId], relationIds: [] }, () => api.postMessage({ type: 'openFile', nodeId })); },
   toggleGroup,
   context: (nodeId, point) => openDepthMenu(nodeId, point),
-  selection: value => { if (rendering) return; selected = value; renderDetails(); },
+  selection: value => {
+    if (rendering) return;
+    canvasSelection = value;
+    if (canvasSelectionQueued) return;
+    canvasSelectionQueued = true;
+    queueMicrotask(() => { canvasSelectionQueued = false; const next = canvasSelection; canvasSelection = undefined; if (next) void changeSelection(next); });
+  },
   save: value => { canvasState = value; persist(); }
 }, saved.canvas);
 workbench = new AnalysisWorkbench({
   send: message => api.postMessage(message),
   reveal: (nodeIds, relationIds = []) => {
-    for (const id of nodeIds) forcedIds.add(id);
-    selected = { nodeIds: nodeIds.slice(0, 500), relationIds };
-    renderProjection(); renderDetails();
+    void changeSelection({ nodeIds: nodeIds.slice(0, 500), relationIds }, () => {
+      for (const id of nodeIds) forcedIds.add(id);
+      renderProjection();
+    });
   },
   select: nodeId => {
-    selected = { nodeIds: [nodeId], relationIds: [] }; renderDetails();
-    canvas.select(selected.nodeIds);
+    void changeSelection({ nodeIds: [nodeId], relationIds: [] });
   },
   contextData, beforeRestore: resolveDrafts
 });
@@ -220,7 +296,7 @@ async function resolveDrafts(): Promise<boolean> {
   try {
     const choice = await chooseDraftAction();
     if (choice === 'stay') return false;
-    if (choice === 'discard') { groupControls.discardDraft(); noteDraft.dirty = false; return true; }
+    if (choice === 'discard') { groupControls.discardDraft(); noteDrafts.delete(noteDraft.key); noteDraft.dirty = false; return true; }
     if (!await groupControls.saveDraft()) return false;
     if (!noteDraft.dirty) return true;
     if (saveNote.disabled) { noteHint.textContent = 'Заметку нельзя сохранить: сначала пометьте выбранный элемент. Переход отменён.'; return false; }
@@ -231,6 +307,27 @@ async function resolveDrafts(): Promise<boolean> {
       pendingNoteSave = { requestId, resolve, timer: setTimeout(() => { if (pendingNoteSave?.requestId === requestId) { pendingNoteSave = undefined; resolve(false); } }, 15000) };
     });
   } finally { draftTransition = false; }
+}
+function selectCanvas(): void {
+  const previous = rendering; rendering = true; canvas.select(selected.nodeIds, selected.relationIds); rendering = previous;
+}
+async function changeSelection(next: CanvasSelection, after?: () => void): Promise<void> {
+  const key = (selection: CanvasSelection) => JSON.stringify([[...selection.nodeIds].sort(), [...selection.relationIds].sort()]);
+  if (key(next) !== key(selected)) {
+    selectCanvas();
+    if (!await resolveDrafts()) { selectCanvas(); renderDetails(); return; }
+    selected = next; relationLimit = 100;
+  }
+  after?.(); selectCanvas(); renderDetails();
+  if (next.nodeIds.length || next.relationIds.length) showPane('details');
+}
+function updateNoteFeedback(): void {
+  const unavailable = [...noteDrafts.values()].filter(draft => draft.dirty && draft.key !== noteDraft.key).length;
+  recoverNotes.hidden = unavailable === 0;
+  recoverNotes.textContent = `Несохранённые заметки (${unavailable})`;
+  noteHint.textContent = pendingNote ? 'Сохранение заметки…' : noteDraft.dirty ? 'Заметка не сохранена.'
+    : saveNote.disabled ? noteHint.dataset.unavailable ?? 'Для заметки выберите помеченный элемент группы.' : 'Заметка сохранена.';
+  if (unavailable) noteHint.textContent += ' Черновик к другому элементу сохранён в этой вкладке.';
 }
 function restoreLocalContext(data: TaskContextData): void {
   const ui = data.ui;
@@ -252,7 +349,8 @@ function toggleGroup(groupId: string): void {
   renderProjection();
 }
 function updateOptions(control: HTMLSelectElement, values: string[], allLabel: string, restored?: string, labels?: Map<string, string>): void {
-  const current = control.value || restored || '';
+  const current = control.dataset.optionsReady ? control.value : control.value || restored || '';
+  if (values.length) control.dataset.optionsReady = 'true';
   const options = [['', allLabel], ...values.sort((left, right) => (labels?.get(left) ?? left).localeCompare(labels?.get(right) ?? right)).map(value => [value, labels?.get(value) ?? value])];
   if (control.options.length !== options.length || Array.from(control.options).some((option, index) => option.value !== options[index][0] || option.textContent !== options[index][1])) {
     control.replaceChildren(...options.map(([value, text]) => { const option = element('option', '', text); option.value = value; return option; }));
@@ -261,6 +359,9 @@ function updateOptions(control: HTMLSelectElement, values: string[], allLabel: s
 }
 function render(): void {
   groups = parseGroups(state.annotations);
+  cancelIndex.disabled = state.analytics?.index.state !== 'building';
+  cancelIndex.title = cancelIndex.disabled ? 'Сейчас индексация не выполняется.' : 'Остановить построение индекса; существующая карта останется с отметкой об устаревании.';
+  rebuildButton.title = state.analytics?.index.state === 'building' ? 'Перезапустить построение индекса' : 'Обновить индекс файлов и зависимостей';
   mode.value = state.view.mode; follow.input.checked = state.view.follow;
   depth.value = String(state.view.depth); if (!depth.value) { const option = element('option', '', String(state.view.depth)); option.value = String(state.view.depth); depth.append(option); depth.value = option.value; }
   depth.disabled = expandDepth.disabled = state.view.mode === 'project';
@@ -268,6 +369,11 @@ function render(): void {
   const localCount = Object.keys(state.view.nodeDepths ?? {}).length;
   resetDepths.textContent = `Сбросить локальные (${localCount})`; resetDepths.disabled = localCount === 0;
   grouping.value = state.view.groupBy; external.input.checked = !state.view.hideExternal; tests.input.checked = !state.view.hideTests; collapsed.input.checked = state.view.collapseReexports;
+  colorPreset.value = state.view.colorPreset ?? 'family';
+  updateOptions(scopeRoot, [...new Set(state.graph.nodes.flatMap(node => node.file ? [node.file.rootId] : []))], 'Выберите корень', undefined,
+    new Map(state.graph.nodes.flatMap(node => node.file ? [[node.file.rootId, node.projectName ?? 'Корень проекта'] as [string, string]] : [])));
+  hydrateScopeEditor();
+  scopeStatus.textContent = `Показ (V): ${describeScope(state.view.presentationScope, state.graph.nodes)} · Анализ (Q): ${describeScope(state.view.queryScope, state.graph.nodes)}`;
   updateOptions(format, [...new Set(state.graph.nodes.map(node => node.format))], 'Все форматы', saved.format);
   updateOptions(project, [...new Set(state.graph.nodes.map(node => node.projectId))], 'Все приложения', saved.project,
     new Map(state.graph.nodes.map(node => [node.projectId, node.projectName ?? node.projectId])));
@@ -280,14 +386,21 @@ function render(): void {
   renderProjection(); renderDetails();
 }
 function renderStatus(): void {
-  status.textContent = `${state.analytics ? `v${state.analytics.runtime.host.extensionVersion} · ${state.analytics.index.state} · ` : ''}${state.status} · ${state.graph.stats.files} файлов · ${state.graph.stats.relations} связей · ревизия ${state.graph.revision}`;
+  const indexLabels: Record<string, string> = { empty: 'Нет индекса', building: 'Индексация', ready: 'Индекс актуален', stale: 'Индекс устарел', failed: 'Ошибка индекса', cancelled: 'Индексация остановлена' };
+  const focused = state.graph.nodes.find(node => node.id === state.view.focusId);
+  focusSummary.textContent = state.view.mode === 'project' ? 'Обзор проекта. Выбор файла открывает детали.' : `В центре: ${focused?.file?.path ?? 'файл не выбран'} · ${state.view.follow ? 'следование за редактором включено' : 'центр закреплён'}`;
+  status.textContent = `${state.analytics ? `v${state.analytics.runtime.host.extensionVersion} · ${indexLabels[state.analytics.index.state]} · ` : ''}${state.status} · ${state.graph.stats.files} файлов · ${state.graph.stats.relations} связей · ревизия ${state.graph.revision} · Анализ: ${describeScope(state.view.queryScope, state.graph.nodes)}`;
   status.title = status.textContent;
+}
+function editScope(kind: ScopeKind): void {
+  scopeControls.open = true; scopeTarget.value = kind; hydrateScopeEditor(true); showPane('list', true); scopeTarget.focus({ preventScroll: true }); scopeControls.scrollIntoView({ block: 'nearest' });
 }
 function renderProjection(): void {
   const group = activeGroup();
   const marks = group ? groupFilterIds(state.graph, group) : undefined;
   const active = state.analytics?.active;
-  const answer = active?.result?.operation === 'success' ? active.result : active?.previousResult;
+  const proposedAnswer = active?.result?.operation === 'success' ? active.result : active?.previousResult;
+  const answer = proposedAnswer && (proposedAnswer.queryScopeSignature ?? 'all') === scopeSignature(state.view.queryScope) ? proposedAnswer : undefined;
   retainedSelectionIds = new Set([...retainedSelectionIds].filter(id => selected.nodeIds.includes(id)));
   const revealed = new Set([...forcedIds, ...retainedSelectionIds]);
   const options: ProjectionOptions = { forcedIds: revealed, markedIds: groupOnly.input.checked ? (marks ?? new Set()) : undefined,
@@ -295,7 +408,8 @@ function renderProjection(): void {
     queryNodeIds: answer ? new Set(answer.nodeIds) : undefined,
     queryRelationIds: answer ? new Set(answer.relationIds) : undefined };
   const base = projectGraph(state.graph, state.view, options);
-  const contributions = activeBranchContributions(new Set(base.nodes.map(n => n.id)), state.analytics?.branches ?? []);
+  const contributions = activeBranchContributions(new Set(base.nodes.map(n => n.id)), (state.analytics?.branches ?? []).filter(branch => branch.result?.freshness === 'current'
+    && (branch.result.queryScopeSignature ?? 'all') === scopeSignature(state.view.queryScope)));
   const projection = contributions.nodeIds.size ? projectGraph(state.graph, state.view, { ...options, branchNodeIds: contributions.nodeIds, branchRelationIds: contributions.relationIds }) : base;
   if ((state.analytics?.active || contributions.nodeIds.size) && projection.nodes.length > 500) {
     const keep = new Set([...new Set([...selected.nodeIds, ...forcedIds, ...projection.nodes.map(n => n.id)])].slice(0, 500));
@@ -304,7 +418,7 @@ function renderProjection(): void {
   const matching = searchGraph(state.graph, searchInput.value);
   const grouped = groupProjection(projection, state.view.groupBy, collapsedGroupIds, revealed);
   visibleGroups = grouped.groups;
-  const appearance = createGraphAppearance(state.graph, group, grouped.groups, showGroupColors);
+  const appearance = createGraphAppearance(state.graph, group, grouped.groups, showGroupColors, state.view.colorPreset ?? 'family');
   rendering = true;
   canvas.render(grouped, state.view, appearance, new Set(matching.map(node => node.id)), !!state.analytics?.active);
   canvas.select(selected.nodeIds, selected.relationIds);
@@ -327,26 +441,39 @@ function renderProjection(): void {
   }
   for (const node of nodes.slice(0, 300)) {
     const row = element('div', 'file-row'); row.setAttribute('role', 'listitem');
-    const choose = button(node.label, () => {
-      selected = { nodeIds: [node.id], relationIds: [] };
-      if (!visible.has(node.id)) { forcedIds.add(node.id); renderProjection(); }
-      canvas.select([node.id]); canvas.center(node.id); renderDetails();
-    }, `${node.file?.path ?? node.packageName ?? node.label} · ${node.projectName ?? node.projectId}`);
-    choose.className = 'file-choice';
+    const choose = button(node.label, () => { void changeSelection({ nodeIds: [node.id], relationIds: [] }, () => {
+      if (!visible.has(node.id) && inScope(node, state.view.queryScope)) { forcedIds.add(node.id); renderProjection(); }
+      canvas.center(node.id);
+    }); }, `${node.file?.path ?? node.packageName ?? node.label} · ${node.projectName ?? node.projectId}`);
+    choose.className = 'file-choice'; choose.dataset.nodeId = node.id; choose.setAttribute('aria-pressed', String(selected.nodeIds.includes(node.id)));
     choose.addEventListener('keydown', event => {
       if ((event.key === 'F10' && event.shiftKey) || event.key === 'ContextMenu') { event.preventDefault(); openDepthMenu(node.id, undefined, choose); }
       if (event.key === 'Enter' && node.kind === 'file') { event.preventDefault(); api.postMessage({ type: 'openFile', nodeId: node.id }); }
     });
     choose.addEventListener('contextmenu', event => { event.preventDefault(); openDepthMenu(node.id, { x: event.clientX, y: event.clientY }, choose); });
     const badges = groups.filter(item => item.files.some(mark => sameFile(mark.file, node.file))).map(item => item.name);
-    const path = element('span', 'file-path', `${node.file?.path ?? node.packageName ?? 'Внешний пакет'}${!visible.has(node.id) ? ' · скрыт — показать' : ''}${badges.length ? ` · ${badges.join(', ')}` : ''}`);
+    const outside = !inScope(node, state.view.queryScope);
+    const path = element('span', 'file-path', `${node.file?.path ?? node.packageName ?? 'Внешний пакет'}${outside ? ' · вне Q: предпросмотр, Enter — открыть' : !visible.has(node.id) ? ' · скрыт видом — показать' : ''}${badges.length ? ` · ${badges.join(', ')}` : ''}`);
     row.append(choose, path); results.append(row);
   }
   if (nodes.length > 300) results.append(element('p', 'hint', 'Показаны первые 300 результатов. Уточните поиск; индекс содержит все результаты.'));
   empty.hidden = grouped.nodes.length + collapsedCount > 0;
-  empty.textContent = state.graph.nodes.length === 0 ? 'Индекс строится или проект не содержит доступных файлов.'
+  const scopedFiles = state.graph.nodes.filter(node => node.file && inScope(node, state.view.queryScope));
+  const emptyMessage = state.graph.nodes.length === 0 ? state.analytics?.index.state === 'building' ? 'Индекс строится. Файлы появятся после анализа.' : 'Нет доступных файлов в индексе. Откройте папку проекта или пересчитайте индекс.'
     : state.view.mode === 'file' && !state.view.focusId ? 'Откройте карту из файла или найдите файл слева и выберите «В центр карты».'
-      : 'Нет узлов с такими фильтрами. Поиск слева работает по всему проекту.';
+      : state.view.queryScope && !scopedFiles.length ? 'В области анализа нет доступных файлов. Проверьте папки и исключённые роли.'
+        : state.view.presentationScope && !scopedFiles.some(node => inScope(node, state.view.presentationScope)) ? 'Области показа и анализа не пересекаются. Измените одну из областей.'
+      : state.view.mode === 'file' && state.view.focusId && !inScope(state.graph.nodes.find(node => node.id === state.view.focusId), state.view.queryScope) ? 'Фокус вне области анализа. Откройте файл из поиска или явно измените область анализа.'
+        : 'Нет узлов с такими фильтрами. Поиск слева работает по всему проекту.';
+  empty.replaceChildren(element('p', '', emptyMessage));
+  if (!empty.hidden) {
+    const actions = element('div', 'actions');
+    if (!state.graph.nodes.length && state.analytics?.index.state !== 'building') actions.append(button('Пересчитать индекс', () => api.postMessage({ type: 'rebuild' })));
+    else if (state.view.queryScope && !scopedFiles.length || state.view.mode === 'file' && state.view.focusId && !inScope(state.graph.nodes.find(node => node.id === state.view.focusId), state.view.queryScope)) actions.append(button('Изменить область анализа', () => editScope('queryScope')));
+    else if (state.view.presentationScope && !scopedFiles.some(node => inScope(node, state.view.presentationScope))) actions.append(button('Изменить показ на карте', () => editScope('presentationScope')), button('Изменить область анализа', () => editScope('queryScope')));
+    else if (state.graph.nodes.length) actions.append(button('Очистить фильтры показа', () => { searchInput.value = format.value = project.value = role.value = folder.value = ''; groupOnly.input.checked = false; direction.value = 'both'; changeFilters(); }));
+    empty.append(actions);
+  }
   persist();
 }
 function renderDetails(): void {
@@ -357,8 +484,8 @@ function renderDetails(): void {
   const allMarked = selected.nodeIds.every(id => group?.files.some(mark => sameFile(mark.file, state.graph.nodes.find(node => node.id === id)?.file)))
     && selected.relationIds.every(id => { const edge = state.graph.relations.find(edge => edge.id === id); return !!edge && group?.relations.some(mark => relationMarked(mark, edge)); });
   saveNote.disabled = !canMark || !allMarked || !!pendingNote;
+  noteHint.dataset.unavailable = canMark && !allMarked ? 'Для заметки сначала добавьте выбранные элементы в группу.' : 'Для заметки выберите помеченный элемент группы.';
   note.disabled = !!pendingNote;
-  noteHint.textContent = canMark && !allMarked ? 'Для заметки сначала добавьте выбранные элементы в группу.' : '';
   groupControls.update({ groups, activeGroupId: state.view.activeGroupId,
     selection: { nodeIds: selected.nodeIds.filter(id => state.graph.nodes.some(node => node.id === id && node.kind === 'file')), relationIds: selected.relationIds },
     error: state.annotationError, result: annotationResult });
@@ -415,9 +542,14 @@ function renderDetails(): void {
   }
   if (!hasSelection) details.append(element('p', 'hint', 'Выберите файл или стрелку. Для нескольких элементов используйте Ctrl/⌘ или выделение рамкой.'));
   const noteKey = JSON.stringify([state.view.activeGroupId, [...selected.nodeIds].sort(), [...selected.relationIds].sort()]);
-  if (noteDraft.key !== noteKey) noteDraft = { key: noteKey, text: currentNote, dirty: false };
+  if (noteDraft.key !== noteKey) {
+    if (noteDraft.dirty) noteDrafts.set(noteDraft.key, noteDraft);
+    noteDraft = noteDrafts.get(noteKey) ?? { key: noteKey, text: currentNote, dirty: false };
+  }
   else if (!noteDraft.dirty && !pendingNote) noteDraft.text = currentNote;
   if (note.value !== noteDraft.text) note.value = noteDraft.text;
+  updateNoteFeedback();
+  results.querySelectorAll<HTMLButtonElement>('.file-choice').forEach(control => control.setAttribute('aria-pressed', String(selected.nodeIds.includes(control.dataset.nodeId ?? ''))));
   const diagnostics = state.graph.diagnostics;
   problemSummary.textContent = `Диагностика (${diagnostics.length}) · неразрешённых обращений ${state.graph.unresolved.length}`;
   problemList.replaceChildren();
@@ -429,14 +561,14 @@ function renderDetails(): void {
   workbench?.update(state, selected, visibleNodeIds);
 }
 function appendRelations(edges: Relation[], endpoint: 'sourceId' | 'targetId'): void {
-  for (const edge of edges.slice(0, 100)) {
+  for (const edge of edges.slice(0, relationLimit)) {
     const node = state.graph.nodes.find(item => item.id === edge[endpoint]);
     const row = button(`${node?.label ?? edge[endpoint]} · ${edge.kind}${edge.certainty === 'inferred' ? ' · ?' : ''}`, () => {
-      selected = { nodeIds: [], relationIds: [edge.id] }; canvas.select([], [edge.id]); renderDetails();
+      void changeSelection({ nodeIds: [], relationIds: [edge.id] });
     }, node?.file?.path ?? edge.specifier ?? 'Показать связь');
     row.className = 'relation-choice'; details.append(row);
   }
-  if (edges.length > 100) details.append(element('p', 'hint', 'Показаны первые 100 связей.'));
+  if (edges.length > relationLimit) details.append(button(`Показать ещё связи (${Math.min(100, edges.length - relationLimit)})`, () => { relationLimit += 100; renderDetails(); }));
 }
 function parseGroups(value: unknown): AnnotationGroup[] {
   if (!value || typeof value !== 'object' || !Array.isArray((value as { groups?: unknown }).groups)) return [];
@@ -450,7 +582,7 @@ window.addEventListener('message', event => {
   if (message?.type === 'annotationResult') {
     annotationResult = message;
     if (pendingNote?.requestId === message.requestId) {
-      if (message.ok && pendingNote.key === noteDraft.key) noteDraft.dirty = false;
+      if (message.ok) { noteDrafts.delete(pendingNote.key); if (pendingNote.key === noteDraft.key) noteDraft.dirty = false; }
       pendingNote = undefined;
     }
     if (pendingNoteSave?.requestId === message.requestId) { clearTimeout(pendingNoteSave.timer); pendingNoteSave.resolve(message.ok); pendingNoteSave = undefined; }

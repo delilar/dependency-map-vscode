@@ -9,8 +9,16 @@ import { extractJavascript, type JsResult, type Reference, type TokenRef } from 
 import { extractEnvKeys, extractResources } from './resources';
 import { classifyFile, type RoleContext } from '../shared/roles';
 import { formatCapabilities } from './formats';
-import type { BindingOccurrence, ExportEntry, FileCoverage } from '../shared/query-model';
+import type { BindingOccurrence, FileCoverage } from '../shared/query-model';
 import { exportTables, resolveExport } from './export-resolution';
+import { extractComponent } from './components';
+import { extractDocument, extractEmbeddedGraphQL } from './documents';
+import { emptySourceResult, mergeSourceRegion } from './result-utils';
+import { readStaticConfig, splitSpecifier, webConfigPattern } from './web-context';
+import { fileMetadata } from '../shared/file-metadata';
+import { applyFrameworks } from './frameworks';
+import { frameworkProfile } from './framework-profile';
+import { symbolContributions } from './symbol-contributions';
 export { formatCapabilities } from './formats';
 
 const slash = (value: string) => value.replace(/\\/g, '/');
@@ -21,26 +29,34 @@ const isEnv = (value: string) => /^\.env(?:\.|$)/i.test(path.basename(value));
 const forbiddenPath = (value: string) => slash(value).split('/').some(part => ['.git', 'node_modules'].includes(part.toLowerCase()));
 const builtins = new Set(builtinModules.map(name => name.replace(/^node:/, '')));
 const maxTextBytes = 2 * 1024 * 1024;
-type ParsedSource = ReturnType<typeof extractJavascript> | ReturnType<typeof extractResources>;
+type ParsedSource = JsResult;
 const parsedCache = new Map<string, { text: string; result: ParsedSource }>();
 let parsedCacheBytes = 0;
 let parsedCacheWorkspace = '';
 
-function parseSource(file: string, text: string): { result: ParsedSource; reused: boolean } {
+async function parseSource(file: string, text: string): Promise<{ result: ParsedSource; reused: boolean }> {
   const key = canonical(file);
   const previous = parsedCache.get(key);
   const reused = previous?.text === text;
-  const original = reused ? previous.result : javascript.test(file) ? extractJavascript(file, text) : extractResources(file, text);
+  let original = previous?.result;
+  if (!reused) {
+    try {
+      original = javascript.test(file) ? extractJavascript(file, text) : await extractComponent(file, text) ?? await extractDocument(file, text) ?? { ...emptySourceResult(), ...extractResources(file, text) };
+      if (javascript.test(file) && /(?:graphql-tag|@apollo\/client|@urql\/core|['"]urql['"])/.test(text)) mergeSourceRegion(original, await extractEmbeddedGraphQL(file, text), text, 0);
+    } catch {
+      original = { ...emptySourceResult(), diagnostics: ['Parser unavailable or failed; file analysis is incomplete'], capabilityReasons: ['parserFailed'] };
+    }
+  }
   if (!reused) {
     if (previous) { parsedCacheBytes -= previous.text.length * 2; parsedCache.delete(key); }
-    parsedCache.set(key, { text, result: original }); parsedCacheBytes += text.length * 2;
+    parsedCache.set(key, { text, result: original! }); parsedCacheBytes += text.length * 2;
     while (parsedCacheBytes > 32 * 1024 * 1024 || parsedCache.size > 2000) {
       const oldest = parsedCache.keys().next().value as string | undefined;
       if (!oldest) break;
       parsedCacheBytes -= parsedCache.get(oldest)!.text.length * 2; parsedCache.delete(oldest);
     }
   }
-  const result = { ...original, references: [...original.references], diagnostics: [...original.diagnostics] };
+  const result = { ...original!, references: original!.references.map(reference => ({ ...reference })), diagnostics: [...original!.diagnostics] };
   return { result, reused };
 }
 
@@ -166,7 +182,8 @@ export class WorkspaceFiles {
     const file = { rootId: entry.root.id, path: relative };
     const basename = path.basename(entry.path);
     const role = classifyFile(relative, roleContext);
-    return { id: fileId(file), file, projectId, kind: 'file', label: basename, format: isEnv(entry.path) ? '.env' : path.extname(entry.path).toLowerCase() || '(none)', ...role };
+    const format = isEnv(entry.path) ? '.env' : path.extname(entry.path).toLowerCase() || '(none)';
+    return { id: fileId(file), file, projectId, kind: 'file', label: basename, format, ...role, ...fileMetadata(format, role?.role) };
   }
 }
 
@@ -184,7 +201,7 @@ interface SessionState {
   resolutionCache: Map<string, { source: string; value: Resolution }>; lookups: Map<string, Set<string>>;
   envKeys: Map<string, EnvKey[]>; graph: GraphSnapshot;
 }
-const changesProjectContext = (file: string) => /^(?:package\.json|(?:ts|js)config(?:\.[^.]+)*\.json|pnpm-workspace\.yaml|lerna\.json)$/.test(path.basename(file));
+const changesProjectContext = (file: string) => /^(?:package\.json|(?:ts|js)config(?:\.[^.]+)*\.json|pnpm-workspace\.yaml|lerna\.json|angular\.json|\.graphqlrc(?:\..*)?)$/.test(path.basename(file)) || webConfigPattern.test(path.basename(file));
 
 async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: AnalysisOptions, overlays: SourceOverlay[], onProgress: (message: string) => void, previous?: SessionState, changedPaths?: string[]): Promise<{ graph: GraphSnapshot; state: SessionState }> {
   const started = performance.now();
@@ -206,6 +223,7 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
   if (!incremental) { files = new WorkspaceFiles(roots, options.exclude, overlays); files.scan(); }
   files = files!;
   const affected = new Set(changed);
+  if (inventoryChanged && previous) for (const [key, contribution] of previous.contributions) if (contribution.result.globs?.length) affected.add(key);
   if (incremental && previous) {
     for (const key of previous.contributions.keys()) if ([...changed].some(candidate => within(candidate, key))) affected.add(key);
     for (const [source, lookups] of previous.lookups) if ([...lookups].some(lookup => [...changed].some(candidate => within(candidate, lookup)))) affected.add(source);
@@ -232,6 +250,7 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
   const nodes = new Map<string, GraphNode>();
   const byPath = new Map<string, GraphNode>();
   const relations = new Map<string, Relation>();
+  const semanticOccurrences: BindingOccurrence[] = [];
   const unresolved: GraphSnapshot['unresolved'] = [];
   const diagnostics: Diagnostic[] = [];
   const projects: Project[] = incremental ? previous!.projects : roots.map(root => ({ id: `project:${root.id}`, directory: root.path }));
@@ -293,6 +312,83 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
   }
   if (incremental) diagnostics.push(...configDiagnostics);
   const configFor = (file: string): Config | undefined => configs.find(config => config.members.has(canonical(file))) ?? configs.find(config => within(config.directory, file));
+  const staticConfigs = new Map<string, ReturnType<typeof readStaticConfig>>();
+  type ToolConfig = { config: Record<string, any>; partial: boolean; directory: string; ambiguous?: boolean };
+  type WebContext = ToolConfig & { aliases: { find: string; replacement?: string }[]; extensions?: string[]; publicDirectory: string; sourceRoot: string; vite: boolean; associationUnknown: boolean; nuxt?: number; sourceDirectory: string; toolConfigs: Record<string, ToolConfig> };
+  const configRecords = new Map<string, { file: string; tool: string; parsed: ReturnType<typeof readStaticConfig> }[]>();
+  for (const project of projects) {
+    const records: { file: string; tool: string; parsed: ReturnType<typeof readStaticConfig> }[] = [];
+    for (const entry of files.files.values()) {
+      if (projectFor(entry.path).id !== project.id || !webConfigPattern.test(path.basename(entry.path))) continue;
+      configInputs.add(canonical(entry.path));
+      const text = files.read(entry.path);
+      const parsed = text === undefined ? { partial: true } : readStaticConfig(entry.path, text);
+      staticConfigs.set(canonical(entry.path), parsed);
+      records.push({ file: entry.path, tool: path.basename(entry.path).split('.config')[0].toLowerCase(), parsed });
+    }
+    configRecords.set(project.id, records);
+  }
+  const createWebContext = (project: Project, sourcePath: string): WebContext => {
+    const toolConfigs: Record<string, ToolConfig> = Object.create(null);
+    const records = (configRecords.get(project.id) ?? []).filter(record => within(path.dirname(record.file), sourcePath));
+    for (const tool of new Set(records.map(record => record.tool))) {
+      const matching = records.filter(record => record.tool === tool).sort((a, b) => path.dirname(b.file).length - path.dirname(a.file).length);
+      const directory = path.dirname(matching[0].file);
+      const nearest = matching.filter(record => canonical(path.dirname(record.file)) === canonical(directory));
+      const ambiguous = nearest.length !== 1 || !nearest[0].parsed.value;
+      toolConfigs[tool] = { config: ambiguous ? {} : nearest[0].parsed.value!, partial: ambiguous || nearest[0].parsed.partial, directory, ambiguous };
+    }
+    const dependencies = { ...project.manifest?.peerDependencies, ...project.manifest?.optionalDependencies, ...project.manifest?.dependencies, ...project.manifest?.devDependencies };
+    const frameworkTools = [['nuxt', 'nuxt'], ['next', 'next'], ['@sveltejs/kit', 'svelte'], ['astro', 'astro']].filter(([dependency]) => Object.hasOwn(dependencies, dependency)).map(([, tool]) => tool);
+    const applications = ['nuxt', 'next', 'svelte', 'astro', 'vite', 'webpack'].filter(tool => toolConfigs[tool]);
+    const nearestDirectory = applications.map(tool => toolConfigs[tool].directory).sort((a, b) => b.length - a.length)[0];
+    const nearestApplications = applications.filter(tool => canonical(toolConfigs[tool].directory) === canonical(nearestDirectory ?? project.directory));
+    const ownConfig = records.find(record => canonical(record.file) === canonical(sourcePath));
+    // shortcut: explicit test files use test context; shared source keeps its application profile until entry contexts are modeled.
+    const testTool = classifyFile(sourcePath)?.role === 'test' ? ['vitest', 'jest', 'playwright', 'cypress'].filter(tool => toolConfigs[tool]) : [];
+    let tool = ownConfig?.tool;
+    let ambiguous = false;
+    if (!tool && testTool.length) { tool = testTool.length === 1 ? testTool[0] : undefined; ambiguous = testTool.length > 1; }
+    if (!tool && !ambiguous) {
+      const preferred = frameworkTools.length === 1 ? frameworkTools[0] : undefined;
+      if (preferred && (!nearestDirectory || canonical(nearestDirectory) === canonical(project.directory) || nearestApplications.includes(preferred))) tool = preferred;
+      else if (nearestApplications.length === 1) tool = nearestApplications[0];
+      else if (nearestApplications.length > 1 || frameworkTools.length > 1) ambiguous = true;
+      else if (dependencies.vite && !dependencies.webpack) tool = 'vite';
+      else if (dependencies.webpack && !dependencies.vite) tool = 'webpack';
+    }
+    const selected = tool ? toolConfigs[tool] : undefined;
+    ambiguous ||= selected?.ambiguous ?? false;
+    const config = selected?.config ?? {};
+    const directory = selected?.directory ?? project.directory;
+    const associationUnknown = !!selected && canonical(directory) !== canonical(project.directory);
+    const nuxtProfile = frameworkProfile(project.manifest, 'nuxt', [3, 4]);
+    const nuxt = tool === 'nuxt' && nuxtProfile.status === 'supported' ? nuxtProfile.major : undefined;
+    const nuxtConfig = toolConfigs.nuxt?.config ?? {};
+    const sourceDirectory = path.resolve(toolConfigs.nuxt?.directory ?? project.directory, typeof nuxtConfig.srcDir === 'string' ? nuxtConfig.srcDir : nuxt && nuxt >= 4 ? 'app' : '.');
+    const aliases: { find: string; replacement?: string }[] = [];
+    const addAlias = (find: unknown, replacement: unknown, relative = false) => {
+      if (typeof find !== 'string' || !find) { aliases.push({ find: '' }); return; }
+      aliases.push({ find, replacement: typeof replacement === 'string' && (path.isAbsolute(replacement) || relative) ? path.resolve(directory, replacement) : undefined });
+    };
+    for (const [value, relative] of [[config.alias, !!nuxt], [config.resolve?.alias, false], [config.kit?.alias, true]] as const) {
+      if (Array.isArray(value)) for (const item of value) addAlias(item?.find, item?.replacement, relative);
+      else if (value && typeof value === 'object') for (const [find, replacement] of Object.entries(value)) addAlias(find, replacement, relative);
+    }
+    if (nuxt) for (const find of ['~', '@', '~~', '@@']) addAlias(find, find.length === 2 ? project.directory : sourceDirectory);
+    if (tool === 'svelte' && frameworkProfile(project.manifest, '@sveltejs/kit', [1, 2]).status === 'supported') addAlias('$lib', typeof config.kit?.files?.lib === 'string' ? config.kit.files.lib : 'src/lib', true);
+    const extensions = Array.isArray(config.resolve?.extensions) && config.resolve.extensions.every((value: unknown) => typeof value === 'string' && /^\.[a-z]+$/i.test(value)) ? config.resolve.extensions as string[] : undefined;
+    const sourceRoot = path.resolve(directory, typeof config.root === 'string' ? config.root : '.');
+    const publicDirectory = path.resolve(sourceRoot, typeof config.publicDir === 'string' ? config.publicDir : tool === 'svelte' ? 'static' : 'public');
+    return { aliases, extensions, publicDirectory, sourceRoot, config, partial: ambiguous || associationUnknown || selected?.partial === true, ambiguous, associationUnknown, directory, vite: tool === 'vite', nuxt, sourceDirectory, toolConfigs };
+  };
+  const webContexts = new Map(projects.map(project => [project.id, createWebContext(project, project.directory)]));
+  const sourceWebContexts = new Map<string, WebContext>();
+  const webContextFor = (file: string) => {
+    const key = canonical(file);
+    if (!sourceWebContexts.has(key)) sourceWebContexts.set(key, createWebContext(projectFor(file), file));
+    return sourceWebContexts.get(key)!;
+  };
   for (const entry of files.files.values()) {
     const project = projectFor(entry.path);
     const node = files.node(entry.path, project.id, { projectRelativePath: slash(path.relative(project.directory, entry.path)), next: !!(project.manifest?.dependencies?.next || project.manifest?.devDependencies?.next) })!;
@@ -315,12 +411,13 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
   const addRelation = (source: GraphNode, target: GraphNode, reference: Reference, certainty: Relation['certainty'] = 'confirmed') => {
     if (target.kind === 'external') nodes.set(target.id, target);
     const id = relationId(source.id, target.id, reference.kind, reference.specifier ?? reference.envName ?? '');
+    if (reference.symbolDependency && reference.occurrences) for (const occurrence of reference.occurrences) semanticOccurrences.push({ relationId: id, ...occurrence });
     contributionRelations?.add(id);
     const existing = relations.get(id);
     if (existing) {
       existing.evidence.push(reference.evidence);
       for (const binding of reference.bindings) if (!existing.bindings.some(item => item.imported === binding.imported && item.local === binding.local && item.typeOnly === binding.typeOnly)) existing.bindings.push(binding);
-    } else relations.set(id, { id, sourceId: source.id, targetId: target.id, kind: reference.kind, certainty, specifier: reference.specifier ?? reference.envName, bindings: [...reference.bindings], evidence: [reference.evidence] });
+    } else relations.set(id, { id, sourceId: source.id, targetId: target.id, kind: reference.kind, certainty, specifier: reference.specifier ?? reference.envName, bindings: [...reference.bindings], evidence: [reference.evidence], ...(reference.provenanceIds?.length ? { provenanceIds: reference.provenanceIds } : {}), ...(reference.symbolDependency ? { symbolDependency: true } : {}) });
   };
   const external = (project: Project, name: string): GraphNode => {
     const id = `external:${encodeURIComponent(project.id)}:${name}`;
@@ -335,7 +432,7 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     const list = [base];
     if (mode === 'config') return extension ? list : [base, `${base}.json`, path.join(base, 'tsconfig.json')];
     const styleExtensions = ['.sass', '.scss'].includes(sourceExtension) ? ['.sass', '.scss', '.css'] : sourceExtension === '.less' ? ['.less'] : sourceExtension === '.styl' ? ['.styl'] : ['.css'];
-    const extensions = mode === 'style' ? styleExtensions : ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.json'];
+    const extensions = mode === 'style' ? styleExtensions : ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.vue', '.svelte', '.astro', '.mdx'];
     if (!extension) list.push(...extensions.map(ext => `${base}${ext}`));
     if (mode === 'style' && ['.sass', '.scss'].includes(sourceExtension)) {
       const partial = path.join(path.dirname(base), `_${path.basename(base)}`);
@@ -349,25 +446,45 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     const unique = [...new Map(found.map(node => [node.id, node])).values()];
     return unique.length === 1 ? unique[0] : undefined;
   };
-  const entryValue = (value: unknown): string | undefined => {
+  const entryValue = (value: unknown, depth = 0): string | undefined => {
     if (typeof value === 'string') return value;
-    if (value && typeof value === 'object') {
-      for (const key of ['source', 'types', 'import', 'default', 'require']) {
-        const target = entryValue((value as Record<string, unknown>)[key]); if (target) return target;
-      }
+    if (value && typeof value === 'object' && !Array.isArray(value) && depth < 30) {
+      const entries = Object.entries(value);
+      if (!Object.hasOwn(value, 'default') || entries.some(([key]) => key.startsWith('.'))) return undefined;
+      // shortcut: accept identical condition targets; add condition profiles when a runtime target is configured.
+      const targets = entries.map(([, branch]) => entryValue(branch, depth + 1));
+      if (targets[0] && targets.every(target => target === targets[0])) return targets[0];
     }
     return undefined;
   };
-  const uncachedResolve = (sourcePath: string, specifier: string, kind: Reference['kind'], requestedMode: ResolutionMode): { node?: GraphNode; reason?: string } => {
+  const uncachedResolve = (sourcePath: string, specifier: string, kind: Reference['kind'], requestedMode: ResolutionMode, sourceExtension?: string): { node?: GraphNode; reason?: string } => {
     const project = projectFor(sourcePath); const config = configFor(sourcePath);
-    const clean = specifier.replace(/[?#].*$/, '');
+    const clean = splitSpecifier(specifier).path;
+    const web = webContextFor(sourcePath);
+    if (web.associationUnknown) {
+      const source = exactNode(sourcePath), message = 'Nearest nested configuration does not establish the runtime entry or working directory; configuration-dependent analysis is partial';
+      if (source && !diagnostics.some(item => item.fileId === source.id && item.message === message)) diagnostics.push({ fileId: source.id, message });
+    }
     const mode = requestedMode === 'module' && !!path.extname(clean) && !javascript.test(clean) ? 'asset' : requestedMode;
-    const find = (base: string) => findCandidate(base, mode, path.extname(sourcePath).toLowerCase());
+    const find = (base: string) => {
+      if (mode === 'module' && web.extensions && !path.extname(base)) {
+        for (const extension of web.extensions) { const node = exactNode(`${base}${extension}`); if (node) return node; }
+      }
+      return findCandidate(base, mode, sourceExtension ?? path.extname(sourcePath).toLowerCase());
+    };
     if (builtins.has(clean.replace(/^node:/, ''))) return { node: external(project, `node:${clean.replace(/^node:/, '')}`) };
     if (clean.startsWith('node:')) return { reason: 'Unknown Node built-in module name' };
     if (/^(?:https?:|data:|blob:|\/\/)/i.test(clean)) return { reason: 'Remote or embedded resource is not a local file' };
-    if (clean.startsWith('/') && kind === 'resource') {
-      return { node: findCandidate(path.join(project.directory, 'public', clean.slice(1)), 'asset', ''), reason: 'Public URL has no unique local file; runtime routing may supply it' };
+    if (clean.startsWith('/') && (kind === 'resource' || /\.html?$/i.test(sourcePath) || web.vite && ['import', 'reexport'].includes(kind))) {
+      if (web.associationUnknown && !path.isAbsolute(typeof web.config.root === 'string' ? web.config.root : '')) return { reason: 'Nested configuration location does not establish the runtime source/public root' };
+      const urlNode = (directory: string, targetMode: ResolutionMode = 'asset') => {
+        const target = path.join(directory, clean.slice(1));
+        return within(directory, target) ? findCandidate(target, targetMode, sourceExtension ?? '') : undefined;
+      };
+      const publicNode = web.config.publicDir === false ? undefined : urlNode(web.publicDirectory);
+      const sourceNode = web.vite ? urlNode(web.sourceRoot, mode) : undefined;
+      const targets = [...new Map([publicNode, sourceNode].filter((node): node is GraphNode => !!node).map(node => [node.id, node])).values()];
+      return { node: !web.ambiguous && targets.length === 1 ? targets[0] : undefined, reason: 'Root URL has no unique permitted source/public file; runtime routing may supply it' };
     }
     if (kind === 'resource' && !clean.startsWith('.') && !path.isAbsolute(clean)) {
       const node = find(path.resolve(path.dirname(sourcePath), clean));
@@ -380,6 +497,41 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
         if (resolved) { const node = exactNode(resolved.resolvedFileName); if (node) return { node }; }
       }
       return { node: find(base), reason: 'Relative target is missing, excluded, ambiguous or outside the workspace' };
+    }
+    if (web.ambiguous) {
+      const source = exactNode(sourcePath);
+      if (source && !diagnostics.some(item => item.fileId === source.id && item.message === 'Application configuration is ambiguous or unavailable')) diagnostics.push({ fileId: source.id, message: 'Application configuration is ambiguous or unavailable' });
+      return { reason: 'Application configuration is ambiguous or unavailable; no tool context was guessed' };
+    }
+    const alias = web.aliases.find(alias => !alias.find || clean === alias.find || clean.startsWith(alias.find + '/'));
+    if (alias) {
+      if (alias.replacement && classifyFile(sourcePath)?.role !== 'test' && !webConfigPattern.test(path.basename(sourcePath))) {
+        const applicationTarget = canonical(path.join(alias.replacement, clean.slice(alias.find.length)));
+        const testConflict = ['vitest', 'jest', 'playwright', 'cypress'].some(tool => {
+          const config = web.toolConfigs[tool]?.config;
+          const value = config?.resolve?.alias ?? config?.alias;
+          const entries = Array.isArray(value) ? value : value && typeof value === 'object' ? Object.entries(value).map(([find, replacement]) => ({ find, replacement })) : [];
+          const other = entries.find(item => typeof item?.find === 'string' && (clean === item.find || clean.startsWith(item.find + '/')));
+          return !!other && (typeof other.replacement !== 'string' || !path.isAbsolute(other.replacement) || canonical(path.join(other.replacement, clean.slice(other.find.length))) !== applicationTarget);
+        });
+        const source = exactNode(sourcePath);
+        const message = 'Alias target depends on application/test entry context; this graph uses the application profile and is partial for shared entry analysis';
+        if (testConflict && source && !diagnostics.some(item => item.fileId === source.id && item.message === message)) diagnostics.push({ fileId: source.id, message });
+      }
+      return { node: alias.replacement ? find(path.join(alias.replacement, clean.slice(alias.find.length))) : undefined, reason: alias.replacement ? 'Static web alias has no unique permitted target' : 'Relative alias replacement is tool-specific and is not converted to an absolute path' };
+    }
+    if (clean.startsWith('#') && project.manifest?.imports) {
+      const mappings = Object.entries(project.manifest.imports as Record<string, unknown>).filter(([key]) => key === clean || key.includes('*') && clean.startsWith(key.split('*')[0]) && clean.endsWith(key.split('*')[1]));
+      if (mappings.length === 1) {
+        const [key, value] = mappings[0];
+        const target = typeof value === 'string' ? value : entryValue(value);
+        if (target?.startsWith('./')) {
+          const wildcard = key.includes('*') ? clean.slice(key.indexOf('*'), clean.length - key.split('*')[1].length) : '';
+          const destination = path.resolve(project.directory, target.replace('*', wildcard));
+          return { node: within(project.directory, destination) ? find(destination) : undefined, reason: 'Package imports mapping has no unique permitted local target' };
+        }
+      }
+      return { reason: 'Package imports mapping is missing, conditional or ambiguous' };
     }
     const paths = config?.options.paths ?? {};
     const matching = Object.entries(paths).filter(([pattern]) => {
@@ -407,8 +559,12 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     if (local.length === 1) {
       const target = local[0]; const subpath = clean.slice(packageName.length).replace(/^\//, '');
       const exported = target.manifest?.exports;
-      const declared = subpath ? entryValue(exported?.[`./${subpath}`]) : entryValue(exported?.['.'] ?? exported) ?? target.manifest?.source ?? target.manifest?.types ?? target.manifest?.module ?? target.manifest?.main;
-      const node = find(path.resolve(target.directory, declared ?? (subpath || 'index')));
+      const hasExports = Object.hasOwn(target.manifest ?? {}, 'exports');
+      const declared = hasExports ? entryValue(subpath ? exported?.[`./${subpath}`] : exported?.['.'] ?? exported)
+        : subpath || (target.manifest?.source ?? target.manifest?.types ?? target.manifest?.module ?? target.manifest?.main);
+      if (hasExports && !declared?.startsWith('./')) return { reason: 'Local package exports entry is blocked, conditional or unsupported' };
+      const destination = path.resolve(target.directory, declared ?? (subpath || 'index'));
+      const node = within(target.directory, destination) ? find(destination) : undefined;
       return { node, reason: 'Local package entry is missing, unsupported or ambiguous' };
     }
     if (clean.startsWith('#') || clean.startsWith('~') || (clean.startsWith('@') && clean.split('/').length < 2)) return { reason: 'Unconfigured alias or package-import mapping' };
@@ -416,11 +572,11 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     if (Object.hasOwn(dependencies, packageName)) return { node: external(project, packageName) };
     return { reason: 'Bare import is neither a configured alias, local package nor declared dependency' };
   };
-  const resolve = (sourcePath: string, specifier: string, kind: Reference['kind'], mode: ResolutionMode = kind === 'resource' ? 'asset' : 'module') => {
-    const key = JSON.stringify([canonical(sourcePath), specifier, kind, mode]);
+  const resolve = (sourcePath: string, specifier: string, kind: Reference['kind'], mode: ResolutionMode = kind === 'resource' ? 'asset' : 'module', sourceExtension?: string) => {
+    const key = JSON.stringify([canonical(sourcePath), specifier, kind, mode, sourceExtension]);
     if (!resolvedReferences.has(key)) {
       resolvingSource = canonical(sourcePath);
-      try { resolvedReferences.set(key, { source: resolvingSource, value: uncachedResolve(sourcePath, specifier, kind, mode) }); }
+      try { resolvedReferences.set(key, { source: resolvingSource, value: uncachedResolve(sourcePath, specifier, kind, mode, sourceExtension) }); }
       finally { resolvingSource = undefined; }
     }
     const result = resolvedReferences.get(key)!.value;
@@ -448,7 +604,6 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
   let reusedSources = 0;
   let reusedContributions = 0;
   const registerJavascript = (source: GraphNode, sourcePath: string, result: ParsedSource) => {
-    if (!javascript.test(sourcePath)) return;
     const jsResult = result as JsResult;
     javascriptResults.set(source.id, { path: sourcePath, result: jsResult });
     if (jsResult.childName) childApps.push({ name: jsResult.childName, node: source });
@@ -461,7 +616,7 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     if (isEnv(entry.path)) continue;
     const extension = path.extname(entry.path).toLowerCase();
     const configFile = /^(?:package|(?:ts|js)config(?:\.[^.]+)*)\.json$/.test(path.basename(entry.path));
-    if (!javascript.test(entry.path) && !['.css', '.scss', '.html', '.htm', '.sass', '.less', '.styl', '.vue', '.svelte', '.astro', '.mdx', '.graphql', '.gql'].includes(extension) && !configFile) continue;
+    if (!javascript.test(entry.path) && formatCapabilities[extension]?.mode !== 'references' && !configFile) continue;
     const key = canonical(entry.path);
     const cached = incremental && !affected.has(key) ? contributions.get(key) : undefined;
     if (cached) {
@@ -477,11 +632,59 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     contributionRelations = new Set<string>();
     const text = files.read(entry.path);
     if (text === undefined) { contributions.delete(key); diagnostics.push({ fileId: source.id, message: 'File unavailable or above the 2 MiB text-analysis limit' }); contributionRelations = undefined; continue; }
-    const parsed = parseSource(entry.path, text);
+    const parsed = await parseSource(entry.path, text);
     if (parsed.reused) reusedSources++;
     const result = parsed.result;
+    for (const glob of result.globs ?? []) {
+      const manifest = projectFor(entry.path).manifest;
+      const viteProfile = ([['vite', [4, 5, 6, 7]], ['nuxt', [3, 4]], ['astro', [4, 5, 6]], ['@sveltejs/kit', [1, 2]]] as const).some(([name, majors]) => frameworkProfile(manifest, name, majors).status === 'supported');
+      if (glob.kind === 'vite' && !viteProfile || glob.kind === 'webpack' && frameworkProfile(manifest, 'webpack', [4, 5]).status !== 'supported') { result.diagnostics.push('Module collection requires a known compatible Vite/Webpack project profile'); continue; }
+      if (glob.patterns.some(pattern => !pattern.startsWith('!') && forbiddenPath(pattern))) { result.diagnostics.push('Module collection includes a forbidden dependency tree; no files are read'); continue; }
+      let matches = 0;
+      for (const candidate of files.files.values()) {
+        const relative = './' + slash(path.relative(path.dirname(entry.path), candidate.path));
+        let matched = false;
+        if (glob.kind === 'vite') {
+          const positive = glob.patterns.filter(pattern => !pattern.startsWith('!')), negative = glob.patterns.filter(pattern => pattern.startsWith('!')).map(pattern => pattern.slice(1));
+          const sourceRoot = webContextFor(entry.path).sourceRoot;
+          const match = (pattern: string) => (!pattern.startsWith('/') || within(sourceRoot, candidate.path)) && minimatch(pattern.startsWith('/') ? '/' + slash(path.relative(sourceRoot, candidate.path)) : relative, pattern, { dot: true });
+          matched = positive.some(match) && !negative.some(match);
+        } else {
+          const directory = path.resolve(path.dirname(entry.path), glob.patterns[0]);
+          const local = './' + slash(path.relative(directory, candidate.path));
+          matched = within(directory, candidate.path) && (glob.recursive || !local.slice(2).includes('/'));
+          if (matched && glob.regexp) { try { matched = new RegExp(glob.regexp.source, glob.regexp.flags).test(local); } catch { matched = false; } }
+        }
+        if (matched && candidate.path !== entry.path) {
+          if (++matches > 10000) { result.diagnostics.push('Module collection target limit reached; analysis is partial'); break; }
+          result.references.push({ kind: 'import', specifier: relative + (glob.query ? glob.query.startsWith('?') ? glob.query : '?' + glob.query : ''), bindings: [], evidence: glob.evidence });
+        }
+      }
+    }
     for (const message of result.diagnostics) diagnostics.push({ fileId: source.id, message });
     registerJavascript(source, entry.path, result);
+    const staticConfig = staticConfigs.get(canonical(entry.path))?.value;
+    if (staticConfig) {
+      const basename = path.basename(entry.path);
+      const strings = (value: unknown): string[] => typeof value === 'string' ? [value] : Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+      const localConfig = (value: unknown, rule: string, baseDirectory = path.dirname(entry.path)) => {
+        for (let target of strings(value).slice(0, 1000)) {
+          if (/[*!?{}]/.test(target) || !target) continue;
+          if (target.startsWith('<rootDir>/')) target = target.slice(10);
+          if (!path.isAbsolute(target) && !target.startsWith('@') && !target.startsWith('#') && !/^[a-z]+:/i.test(target)) target = './' + slash(path.relative(path.dirname(entry.path), path.resolve(baseDirectory, target)));
+          result.references.push({ kind: 'config', specifier: target, bindings: [], resolutionMode: 'module', evidence: { rule } });
+        }
+      };
+      const projectDirectory = projectFor(entry.path).directory;
+      if (/^(?:vite|vitest)\.config\./.test(basename)) for (const field of ['setupFiles', 'globalSetup']) localConfig(staticConfig.test?.[field], `Vitest literal test.${field}`, path.resolve(projectDirectory, typeof staticConfig.root === 'string' ? staticConfig.root : '.'));
+      if (/^(?:jest|playwright)\.config\./.test(basename)) for (const field of ['setupFiles', 'setupFilesAfterEnv', 'globalSetup', 'globalTeardown']) localConfig(staticConfig[field], `Test configuration literal ${field}`, path.resolve(path.dirname(entry.path), typeof staticConfig.rootDir === 'string' ? staticConfig.rootDir : '.'));
+      if (/^cypress\.config\./.test(basename)) for (const profile of ['e2e', 'component']) localConfig(staticConfig[profile]?.supportFile, `Cypress literal ${profile}.supportFile`, projectDirectory);
+      if (/^(?:vite|webpack)\.config\./.test(basename)) {
+        const value = staticConfig.entry ?? staticConfig.build?.lib?.entry;
+        const entries = value && typeof value === 'object' && !Array.isArray(value) ? Object.values(value).flatMap(item => strings(item && typeof item === 'object' && !Array.isArray(item) ? (item as Record<string, unknown>).import : item)) : strings(value);
+        localConfig(entries, 'Build configuration literal entry', path.resolve(projectDirectory, typeof staticConfig.context === 'string' ? staticConfig.context : typeof staticConfig.root === 'string' ? staticConfig.root : '.'));
+      }
+    }
     if (configFile) {
       const config = json(entry.path);
       const addConfig = (target: unknown, rule: string) => { if (typeof target === 'string' && (target.startsWith('.') || !target.includes(':'))) result.references.push({ specifier: target.startsWith('.') ? target : `./${target}`, kind: 'config', bindings: [], evidence: { rule } }); };
@@ -500,9 +703,15 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
         for (const target of targets) addRelation(source, target.node, reference, 'inferred');
       } else if (reference.specifier) {
         const styleImport = /^(?:Stylesheet|Less|Stylus|Indented Sass) @(?:import|use|forward|require)/.test(reference.evidence.rule) && !reference.evidence.rule.includes('url()');
-        const mode: ResolutionMode = styleImport ? 'style' : reference.kind === 'resource' ? 'asset' : reference.kind === 'config' && reference.evidence.rule.startsWith('TypeScript') ? 'config' : 'module';
-        const resolution = resolve(entry.path, reference.specifier, reference.kind, mode);
-        if (resolution.node) addRelation(source, resolution.node, reference, reference.certainty ?? (reference.evidence.rule.startsWith('Static fetch') ? 'inferred' : 'confirmed'));
+        const mode: ResolutionMode = reference.resolutionMode ?? (styleImport ? 'style' : reference.kind === 'resource' ? 'asset' : reference.kind === 'config' && reference.evidence.rule.startsWith('TypeScript') ? 'config' : 'module');
+        const qualifier = splitSpecifier(reference.specifier).qualifier;
+        const keys = qualifier.startsWith('?') ? [...new URLSearchParams(qualifier.slice(1)).keys()] : [];
+        const loaderValue = keys.some(key => ['raw', 'url', 'worker', 'sharedworker', 'init', 'inline', 'no-inline'].includes(key));
+        const unknownLoader = keys.some(key => !['raw', 'url', 'worker', 'sharedworker', 'init', 'inline', 'no-inline', 'import'].includes(key));
+        if ((loaderValue || unknownLoader) && ['import', 'reexport'].includes(reference.kind)) reference.kind = 'resource';
+        if (unknownLoader) unresolved.push({ sourceId: source.id, expression: reference.specifier, reason: 'Unknown loader qualifier; physical source may be shown but its imported value and exports are not assumed', evidence: reference.evidence });
+        const resolution = resolve(entry.path, reference.specifier, reference.kind, loaderValue || unknownLoader ? 'asset' : mode, reference.sourceExtension);
+        if (resolution.node) addRelation(source, resolution.node, reference, reference.certainty ?? (unknownLoader || reference.evidence.rule.startsWith('Static fetch') ? 'inferred' : 'confirmed'));
         else unresolved.push({ sourceId: source.id, expression: reference.specifier, reason: resolution.reason ?? 'Cannot resolve target', evidence: reference.evidence });
       }
     }
@@ -519,34 +728,36 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     const target = matches.length === 1 ? matches[0].node : external(projects.find(item => item.id === ref.source.projectId)!, `child-app:${ref.name}`);
     addRelation(ref.source, target, { specifier: ref.name, kind: 'framework', bindings: [], evidence: ref.evidence }, 'inferred');
   }
-  for (const consumer of consumers) {
-    const matches = providers.filter(provider => provider.tokenId === consumer.tokenId && provider.source.projectId === consumer.source.projectId);
-    for (const provider of matches) if (provider.source.id !== consumer.source.id) addRelation(consumer.source, provider.source, {
-      kind: 'framework', specifier: `DI:${consumer.tokenId}`, bindings: [],
-      evidence: { ...consumer.evidence, rule: 'Tramvai declared provider candidate; registration, overrides and runtime scope are not proven' }
-    }, 'inferred');
-    if (!matches.length) unresolved.push({ sourceId: consumer.source.id, reason: 'Tramvai token has no statically declared provider in this project; it may be supplied by a runtime scope', evidence: consumer.evidence });
-  }
-  for (const project of projects.filter(item => item.manifest?.dependencies?.next || item.manifest?.devDependencies?.next)) {
-    const projectFiles = [...files.files.values()].filter(entry => byPath.get(canonical(entry.path))?.projectId === project.id);
-    for (const entry of projectFiles) {
-      const relative = slash(path.relative(project.directory, entry.path));
-      const source = byPath.get(canonical(entry.path))!;
-      if (/^(?:src\/)?pages\/(?!api\/).*\.[jt]sx?$/.test(relative) && !/^_/.test(path.basename(entry.path))) {
-        const app = projectFiles.find(item => /^(?:src\/)?pages\/_app\.[jt]sx?$/.test(slash(path.relative(project.directory, item.path))));
-        if (app) addRelation(source, byPath.get(canonical(app.path))!, { kind: 'framework', bindings: [], evidence: { rule: 'Next.js Pages Router wraps pages in _app; not a source import' } });
-      }
-      if (/^(?:src\/)?app\/.*\/(?:page|layout|loading|error|not-found|template)\.[jt]sx?$/.test(relative) || /^(?:src\/)?app\/(?:page|layout|loading|error|not-found|template)\.[jt]sx?$/.test(relative)) {
-        if (!/^page\./.test(path.basename(entry.path))) continue;
-        const directory = path.dirname(entry.path);
-        const layouts = projectFiles.filter(item => /^layout\.[jt]sx?$/.test(path.basename(item.path)) && within(path.dirname(item.path), directory) && /^(?:src\/)?app\//.test(slash(path.relative(project.directory, item.path))));
-        for (const layout of layouts) addRelation(source, byPath.get(canonical(layout.path))!, { kind: 'framework', bindings: [], evidence: { rule: 'Next.js App Router ancestor layout convention; not a source import' } });
-        for (const sibling of projectFiles.filter(item => path.dirname(item.path) === directory && /^(?:loading|error|not-found|template)\.[jt]sx?$/.test(path.basename(item.path)))) addRelation(source, byPath.get(canonical(sibling.path))!, { kind: 'framework', bindings: [], evidence: { rule: 'Next.js App Router segment boundary convention; conditional runtime activation' } }, 'inferred');
-      }
-    }
+  let initialTables: ReturnType<typeof exportTables> | undefined;
+  const declarationTables = () => initialTables ??= exportTables({ revision: 0, nodes: [...nodes.values()], relations: [...relations.values()], unresolved: [], diagnostics: [], ...symbolContributions([...relations.values()], javascriptResults),
+    coverage: [...javascriptResults].map(([fileId, entry]) => ({ fileId, status: 'parsed', reasonCodes: entry.result.unsupportedExports ? ['unsupportedCommonJs'] : [], unresolvedCount: 0,
+      symbols: javascript.test(entry.path) || ['.vue', '.svelte', '.astro', '.mdx'].includes(path.extname(entry.path)) ? entry.result.diagnostics.length ? 'limited' : 'available' : 'unavailable' })),
+    stats: { files: files.files.size, relations: relations.size, elapsedMs: 0 } });
+  await applyFrameworks({
+    files: [...files.files.values()].map(entry => ({ node: byPath.get(canonical(entry.path))!, path: entry.path, result: javascriptResults.get(byPath.get(canonical(entry.path))!.id)?.result })),
+    projects: projects.map(project => ({ ...project, context: webContexts.get(project.id)! })),
+    read: file => !isEnv(file) && (javascript.test(file) || formatCapabilities[path.extname(file).toLowerCase()]?.mode === 'references') ? files.read(file) : undefined, add: addRelation,
+    diagnostic: (source, message) => diagnostics.push({ fileId: source.id, message, capability: 'framework' }),
+    resolveDeclaration: (sourcePath, module, imported) => {
+      const target = resolve(sourcePath, module, 'import').node;
+      if (!target?.file) return undefined;
+      const result = resolveExport(declarationTables(), target.id, imported, 'value');
+      if (result.status !== 'resolved') return undefined;
+      const candidate = result.candidates[0];
+      const provenanceIds = [...new Set([target.id, candidate.fileId, ...candidate.relationIds.flatMap(id => { const edge = relations.get(id); return edge ? [edge.sourceId, edge.targetId] : []; })])];
+      return { fileId: candidate.fileId, name: candidate.name, range: candidate.range, provenanceIds };
+    },
+  });
+  for (let index = unresolved.length - 1; index >= 0; index--) {
+    const reference = unresolved[index];
+    if (!['#imports', '#components'].includes(reference.expression ?? '')) continue;
+    const bindings = javascriptResults.get(reference.sourceId)?.result.references.filter(item => item.specifier === reference.expression).flatMap(item => item.bindings) ?? [];
+    const edges = [...relations.values()].filter(edge => edge.sourceId === reference.sourceId && ['import', 'reexport'].includes(edge.kind) && edge.specifier === reference.expression);
+    if (bindings.length && bindings.every(binding => edges.some(edge => edge.bindings.some(item => item.imported === binding.imported)))) unresolved.splice(index, 1);
   }
   const coverage: FileCoverage[] = [];
-  const diagnosticFiles = new Set(diagnostics.map(item => item.fileId));
+  const diagnosticFiles = new Set(diagnostics.filter(item => item.capability !== 'framework').map(item => item.fileId));
+  const frameworkLimited = new Set(diagnostics.filter(item => item.capability === 'framework').map(item => item.fileId));
   const unresolvedCounts = new Map<string, number>();
   for (const reference of unresolved) unresolvedCounts.set(reference.sourceId, (unresolvedCounts.get(reference.sourceId) ?? 0) + 1);
   for (const entry of files.files.values()) {
@@ -556,44 +767,49 @@ async function analyzeWorkspaceInternal(roots: WorkspaceRoot[], options: Analysi
     const configFile = /^(?:package|(?:ts|js)config(?:\.[^.]+)*)\.json$/.test(path.basename(entry.path));
     const nodeOnly = format?.mode === 'node-only' && !configFile || !format && !configFile;
     const result = javascriptResults.get(node.id)?.result;
-    const deferred = ['.vue', '.svelte', '.astro', '.mdx', '.graphql', '.gql', '.sass'].includes(node.format);
-    const reasonCodes = readReason ? [readReason] : nodeOnly ? [deferred ? 'unsupportedInternalReferences' : 'resourceNode'] : [];
+    const sourceLike = /\.(?:py|go|rs|java|kt|cs|rb|php|pug|hbs|twig|erb|ejs|coffee|glsl|vert|frag)$/i.test(entry.path);
+    const reasonCodes = readReason ? [readReason] : nodeOnly ? [sourceLike ? 'unsupportedInternalReferences' : 'resourceNode'] : [];
+    reasonCodes.push(...(result?.capabilityReasons ?? []));
     if (diagnosticFiles.has(node.id) && !nodeOnly) reasonCodes.push(configFile ? 'configurationDiagnostic' : 'parseDiagnostic');
+    if (frameworkLimited.has(node.id)) reasonCodes.push('frameworkLimited');
+    if (result?.diagnostics.some(message => message.startsWith('JavaScript/TypeScript parse error'))) reasonCodes.push('scriptParseDiagnostic');
     if (result?.unsupportedExports) reasonCodes.push('unsupportedCommonJs');
     const unresolvedCount = unresolvedCounts.get(node.id) ?? 0;
     if (unresolvedCount) reasonCodes.push('unresolvedReference');
-    coverage.push({ fileId: node.id, status: readReason === 'readFailed' ? 'failed' : readReason ? 'skipped' : nodeOnly ? 'nodeOnly' : 'parsed', reasonCodes, unresolvedCount });
+    const hasSymbols = javascript.test(entry.path) || ['.vue', '.svelte', '.astro', '.mdx'].includes(node.format);
+    coverage.push({ fileId: node.id, status: readReason === 'readFailed' ? 'failed' : readReason ? 'skipped' : nodeOnly ? 'nodeOnly' : 'parsed', reasonCodes, unresolvedCount, symbols: !hasSymbols || result?.unsupportedExports ? 'unavailable' : result ? result.diagnostics.length ? 'limited' : 'available' : 'unavailable' });
   }
-  const exports: ExportEntry[] = [];
-  const bindingOccurrences: BindingOccurrence[] = [];
-  const sourceRelations = new Map<string, Map<string, Relation>>();
-  for (const edge of relations.values()) {
-    const map = sourceRelations.get(edge.sourceId) ?? new Map<string, Relation>();
-    map.set(JSON.stringify([edge.kind, edge.specifier]), edge); sourceRelations.set(edge.sourceId, map);
-  }
-  for (const [sourceId, entry] of javascriptResults) {
-    const relationFor = (kind: string, specifier: string) => sourceRelations.get(sourceId)?.get(JSON.stringify([kind, specifier]));
-    for (const exported of entry.result.exports) exports.push({
-      fileId: sourceId, name: exported.name, namespace: exported.namespace, kind: exported.kind, range: exported.range,
-      ...(exported.forwarded ? { forwarded: { relationId: relationFor(exported.forwarded.referenceKind, exported.forwarded.module)?.id, imported: exported.forwarded.imported } } : {})
-    });
-    for (const reference of entry.result.references) {
-      if (!reference.specifier || !reference.occurrences) continue;
-      const edge = relationFor(reference.kind, reference.specifier);
-      if (edge) for (const occurrence of reference.occurrences) bindingOccurrences.push({ relationId: edge.id, ...occurrence });
-    }
-  }
+  const { exports, bindingOccurrences } = symbolContributions([...relations.values()], javascriptResults, semanticOccurrences);
   coverage.sort((a, b) => a.fileId < b.fileId ? -1 : a.fileId > b.fileId ? 1 : 0);
-  const stableRows = (a: unknown, b: unknown) => JSON.stringify(a).localeCompare(JSON.stringify(b));
-  exports.sort(stableRows); bindingOccurrences.sort(stableRows);
   const declarations: DeclarationTarget[] = [];
   const symbolGraph: GraphSnapshot = { revision: 0, nodes: [...nodes.values()], relations: [...relations.values()], unresolved, diagnostics, exports, coverage, stats: { files: files.files.size, relations: relations.size, elapsedMs: 0 } };
   const tables = exportTables(symbolGraph);
+  const canonicalToken = (id: string): { id: string | undefined; provenance: string[] } => {
+    const [file, name] = JSON.parse(id) as [string, string];
+    const resolution = resolveExport(tables, file, name, 'value');
+    if (resolution.status !== 'resolved') return { id: resolution.status === 'ambiguous' ? undefined : id, provenance: [file] };
+    const candidate = resolution.candidates[0];
+    const provenance = [...new Set([file, candidate.fileId, ...candidate.relationIds.flatMap(id => { const edge = relations.get(id); return edge ? [edge.sourceId, edge.targetId] : []; })])];
+    return { id: JSON.stringify([candidate.fileId, candidate.name]), provenance };
+  };
+  for (const consumer of consumers) {
+    const token = canonicalToken(consumer.tokenId);
+    const matches = token.id ? providers.filter(provider => canonicalToken(provider.tokenId).id === token.id && provider.source.projectId === consumer.source.projectId) : [];
+    for (const provider of matches) if (provider.source.id !== consumer.source.id) addRelation(consumer.source, provider.source, {
+      kind: 'framework', specifier: `DI:${token.id}`, bindings: [], provenanceIds: [...new Set([...token.provenance, ...canonicalToken(provider.tokenId).provenance])],
+      evidence: { ...consumer.evidence, rule: 'Tramvai declared provider candidate; registration, overrides and runtime scope are not proven' }
+    }, 'inferred');
+    if (!matches.length) {
+      unresolved.push({ sourceId: consumer.source.id, reason: 'Tramvai token has no unique statically declared provider in this project; it may be supplied by a runtime scope', evidence: consumer.evidence });
+      const row = coverage.find(row => row.fileId === consumer.source.id);
+      if (row) { row.unresolvedCount++; if (!row.reasonCodes.includes('unresolvedReference')) row.reasonCodes.push('unresolvedReference'); }
+    }
+  }
   for (const relation of relations.values()) {
     if (!['import', 'reexport'].includes(relation.kind)) continue;
     for (const binding of relation.bindings) {
       if (binding.imported === '*') continue;
-      const resolution = resolveExport(tables, relation.targetId, binding.imported, binding.typeOnly ? 'type' : 'both');
+      const resolution = resolveExport(tables, relation.targetId, binding.resolvedImported ?? binding.imported, binding.typeOnly ? 'type' : 'both');
       const found = resolution.status === 'resolved' ? resolution.candidates[0] : undefined;
       const file = found ? nodes.get(found.fileId)?.file : undefined;
       if (found?.range && file && !declarations.some(item => item.relationId === relation.id && item.imported === binding.imported)) declarations.push({ relationId: relation.id, imported: binding.imported, file, range: found.range });

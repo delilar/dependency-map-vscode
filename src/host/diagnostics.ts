@@ -12,8 +12,9 @@ const knownReasons = new Set([
   'deadlineLimit', 'missingTarget', 'exportMissing', 'partialExportResolution', 'resolutionLimited', 'provenancePathMissing', 'unsupportedBinding', 'namespaceImport', 'ambiguousConsumerExport', 'partialConsumerExport', 'ambiguousExport', 'queryQueueLimit', 'indexVersionMismatch',
   'cachedProviderState', 'providerMissing', 'providerInactive', 'providerDisabled', 'providerUninitialized', 'providerReadFailed', 'repositoryReadFailed', 'rowLimit', 'untrackedNotInPhysicalInventory',
   'missingReferences', 'missingRelations', 'groupChanged', 'groupMissing', 'followPaused',
+  'queryScopeChanged', 'parserFailed', 'scriptParseDiagnostic', 'frameworkLimited', 'partialSymbolCoverage', 'frameworkScopeBoundary',
 ]);
-const knownCapabilities = new Set(['queries', 'branches', 'git', 'taskContexts', 'diagnostics']);
+const knownCapabilities = new Set(['queries', 'branches', 'git', 'taskContexts', 'diagnostics', 'webFormats', 'scopes']);
 const count = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.min(1e9, Math.floor(value)) : 0;
 const elapsed = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.min(3600000, Math.round(value * 100) / 100) : 0;
 const reasonSummary = (values: string[]) => ({ codes: [...new Set(values.filter(value => knownReasons.has(value)))].sort(), otherCount: values.filter(value => !knownReasons.has(value)).length });

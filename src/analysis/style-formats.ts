@@ -122,8 +122,6 @@ export function extractAdditionalStyles(file: string, text: string): { reference
         add(raw ?? inferred, node.args?.nodes?.[0]?.nodes?.[0] ?? node, inferred === undefined ? 'Stylus url()' : 'Stylus unquoted URL inferred from syntax; imported bindings are not evaluated', false, inferred !== undefined);
       }
     } else if (extension === '.sass') {
-      const [major, minor] = process.versions.node.split('.').map(Number);
-      if (major < 20 || (major === 20 && minor < 19)) return { references, diagnostics: ['Indented Sass parser requires Node.js 20.19 or newer; file remains indexed without internal references'] };
       const parser = require('sass-parser') as { sass: { parse(text: string, options: { from: string }): { walk(callback: (node: SassNode) => void): void } } };
       const root = parser.sass.parse(text, { from: file });
       const expressions = (expression: SassNode | undefined) => {

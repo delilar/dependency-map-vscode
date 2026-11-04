@@ -5,10 +5,12 @@ import { createServer } from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { parserPlugin, buildParserAssets } from './parser-build.mjs';
 
 if (process.argv.length !== 3) throw new Error('Usage: node scripts/render-project.mjs <workspace-root>');
 await mkdir('.test-dist', { recursive: true });
-await build({ entryPoints: ['src/analysis/index.ts'], outfile: '.test-dist/render-analyzer.cjs', bundle: true, platform: 'node', target: 'node18', format: 'cjs', keepNames: true });
+await buildParserAssets('.test-dist');
+await build({ entryPoints: ['src/analysis/index.ts'], outfile: '.test-dist/render-analyzer.cjs', bundle: true, platform: 'node', target: 'node18', format: 'cjs', keepNames: true, plugins: [parserPlugin] });
 const { analyzeWorkspace } = createRequire(import.meta.url)('../.test-dist/render-analyzer.cjs');
 const directory = path.resolve(process.argv[2]);
 const graph = await analyzeWorkspace([{ id: 'preview', name: path.basename(directory), path: directory }], { exclude: ['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache'] }, []);

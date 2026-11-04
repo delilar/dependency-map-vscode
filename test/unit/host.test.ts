@@ -55,7 +55,7 @@ test('local panel sizes and node depths accept legacy state and reject malformed
   assert.equal(isUiMessage({ type: 'annotation', action: 'createGroupAndMark', requestId: 5 }), false);
 });
 
-test('navigation denies traversal, node_modules and escaped symlink', async () => {
+test('navigation denies traversal, node_modules and escaped symlink', async context => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'dependency-map-nav-'));
   try {
     const root = path.join(directory, 'app');
@@ -71,7 +71,7 @@ test('navigation denies traversal, node_modules and escaped symlink', async () =
     await assert.rejects(resolveAllowedFile({ rootId: 'hidden', path: 'config' }, [{ id: 'hidden', name: 'hidden', path: path.join(directory, '.git') }]));
     await assert.rejects(resolveAllowedFile({ rootId: 'hidden', path: 'index.js' }, [{ id: 'hidden', name: 'hidden', path: path.join(directory, 'node_modules') }]));
     try { await symlink(directory, path.join(root, 'escape'), 'junction'); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') return; throw error; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') { context.skip('Junction creation is unavailable; symlink escape branch was not checked'); return; } throw error; }
     await assert.rejects(resolveAllowedFile({ rootId: 'app', path: 'escape/outside.ts' }, roots));
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

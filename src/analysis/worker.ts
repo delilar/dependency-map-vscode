@@ -5,6 +5,7 @@ import { buildInfo } from '../shared/build-info';
 import { isQueryRequest, sameIndex, type IndexVersion, type QueryRequest, type QueryResult } from '../shared/query-model';
 import { GraphQueryIndex } from './graph-query-index';
 import { executeQuery } from './graph-queries';
+import { scopeSignature } from '../shared/scope';
 
 if (!parentPort) throw new Error('Analysis worker requires a parent port');
 const port = parentPort;
@@ -15,7 +16,7 @@ let published: { index: GraphQueryIndex; version: IndexVersion } | undefined;
 const queries = new Map<string, { cancelled: boolean }>();
 port.postMessage({ type: 'workerReady', build: buildInfo });
 function unavailable(request: QueryRequest, reason: string): QueryResult {
-  const common = { type: 'queryResult' as const, requestId: request.requestId, graph: request.graph, operation: 'failed' as const, coverage: 'unknown' as const, freshness: 'stale' as const, reasonCodes: [reason], limits: request.limits, visitedNodes: 0, examinedRelations: 0, nodeIds: [], relationIds: [], witnesses: [], gitRevision: request.gitRevision };
+  const common = { type: 'queryResult' as const, requestId: request.requestId, graph: request.graph, operation: 'failed' as const, coverage: 'unknown' as const, freshness: 'stale' as const, reasonCodes: [reason], limits: request.limits, visitedNodes: 0, examinedRelations: 0, nodeIds: [], relationIds: [], witnesses: [], gitRevision: request.gitRevision, queryScopeSignature: scopeSignature(request.scope) };
   switch (request.query.kind) {
     case 'impact': return { ...common, kind: 'impact', outcome: 'unknown', directIds: [], indirectIds: [], testIds: [] };
     case 'symbol': return { ...common, kind: 'symbol', outcome: 'unresolved', resolution: { status: 'unresolved', reasonCodes: [reason], candidates: [] } };

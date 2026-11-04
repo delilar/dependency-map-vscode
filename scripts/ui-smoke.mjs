@@ -83,6 +83,7 @@ try {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${address.port}`);
   await page.getByLabel('Режим', { exact: true }).waitFor();
+  await page.locator('.advanced-filters > summary').click();
   assert.equal(await page.locator('.topbar').count(), 0, 'Redundant brand header is removed');
   await page.getByRole('button', { name: 'Profile.tsx', exact: true }).waitFor();
   await page.waitForTimeout(500);
@@ -258,11 +259,12 @@ try {
   const preferences = await page.evaluate(()=>window.__savedState.panelSizes);
   assert(preferences.leftWidth > initialLeft + 10, 'Pointer drag commits the preferred panel width');
   await page.getByRole('separator', { name: 'Высота панели управления', exact: true }).focus(); await page.keyboard.press('ArrowDown');
-  await page.getByRole('separator', { name: 'Высота групп задач', exact: true }).focus(); await page.keyboard.press('ArrowDown');
+  await page.getByRole('separator', { name: 'Высота деталей', exact: true }).focus(); await page.keyboard.press('ArrowDown');
   for (const viewport of [{width:640,height:900},{width:420,height:300},{width:860,height:300}]) {
     await page.setViewportSize(viewport); await page.waitForTimeout(100);
     assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth), `No horizontal overflow at ${viewport.width}x${viewport.height}`);
     assert((await page.locator('.graph').boundingBox()).height>30, 'The graph remains available in a low-height pane');
+    if (viewport.width < 760) await page.getByRole('button', { name: 'Поиск', exact: true }).click();
     await page.getByRole('button', { name: 'Profile.tsx', exact: true }).focus(); await page.keyboard.press('Shift+F10');
     const menuBounds = await page.getByRole('dialog', { name: 'Индивидуальная глубина узла', exact: true }).boundingBox();
     assert(menuBounds.x>=0&&menuBounds.y>=0&&menuBounds.x+menuBounds.width<=viewport.width&&menuBounds.y+menuBounds.height<=viewport.height,'Context dialog stays inside the viewport');

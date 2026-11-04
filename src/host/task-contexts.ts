@@ -5,7 +5,7 @@ import type { GraphSnapshot } from '../shared/model';
 
 interface Memento { get<T>(key: string): T | undefined; update(key: string, value: unknown): PromiseLike<void> }
 interface LocalContexts { version: 1; contexts: SavedTaskContext[] }
-export const taskContextStoreKey = 'dependencyMap.taskContexts.v1';
+export const taskContextStoreKey = 'dependencyMap.taskContexts.v2';
 const maxContexts = 100;
 const maxContextBytes = 2 * 1024 * 1024;
 const maxStoreBytes = 20 * 1024 * 1024;
@@ -78,7 +78,7 @@ export class LocalTaskContextStore {
   constructor(private readonly memento: Memento, private readonly clock: () => number = Date.now) {}
 
   private read(): LocalContexts {
-    const value = this.memento.get<unknown>(taskContextStoreKey);
+    const value = this.memento.get<unknown>(taskContextStoreKey) ?? this.memento.get<unknown>('dependencyMap.taskContexts.v1');
     if (value === undefined) return { version: 1, contexts: [] };
     if (!object(value) || value.version !== 1) throw new Error('Unsupported local task context version. Existing data preserved.');
     if (!fields(value, ['version', 'contexts']) || !Array.isArray(value.contexts) || value.contexts.length > maxContexts || !value.contexts.every(validSaved)) throw new Error('Invalid local task contexts. Existing data preserved.');
@@ -130,6 +130,8 @@ export function previewTaskContext(saved: SavedTaskContext, graph: GraphSnapshot
   ]);
   const missingNodeIds = [...referenced].filter(id => !nodes.has(id)).sort();
   const reasonCodes: string[] = [];
+  const roots = new Set(graph.nodes.flatMap(node => node.file ? [node.file.rootId] : []));
+  if ([data.view.queryScope, data.view.presentationScope].some(scope => scope?.folders.some(folder => !roots.has(folder.rootId)))) reasonCodes.push('scopeRootUnavailable');
   const groupChanged = currentGroupFingerprint !== undefined && currentGroupFingerprint !== saved.groupFingerprint;
   if (missingNodeIds.length) reasonCodes.push('missingReferences');
   if (data.selection.relationIds.some(id => !relations.has(id))) reasonCodes.push('missingRelations');

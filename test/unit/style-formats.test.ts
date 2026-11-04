@@ -79,13 +79,13 @@ test('parser failures are sanitized and never expose source snippets', () => {
   }
 });
 
-test('old Node runtimes return an explicit Sass capability diagnostic before requiring its parser', () => {
+test('bundled Sass parser is not disabled by the previous Node 20 version gate', () => {
   const descriptor = Object.getOwnPropertyDescriptor(process.versions, 'node')!;
   try {
     Object.defineProperty(process.versions, 'node', { value: '18.20.0', configurable: true });
     const result = extractAdditionalStyles('style.sass', '@use "./tokens"\n');
-    assert.deepEqual(result.references, []);
-    assert.match(result.diagnostics[0], /20\.19/);
+    assert.equal(result.references[0]?.specifier, 'tokens');
+    assert.deepEqual(result.diagnostics, []);
   } finally { Object.defineProperty(process.versions, 'node', descriptor); }
 });
 

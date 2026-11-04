@@ -3,13 +3,15 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { parserPlugin, buildParserAssets } from './parser-build.mjs';
 
 const args = process.argv.slice(2);
 if (!args.length || (args.includes('--synthetic') && args.length !== 1)) {
   throw new Error('Usage: node scripts/benchmark.mjs <workspace-root> [other-root ...] OR --synthetic');
 }
 await mkdir('.test-dist', { recursive: true });
-await build({ entryPoints: ['src/analysis/index.ts'], outfile: '.test-dist/benchmark-analyzer.cjs', bundle: true, platform: 'node', target: 'node18', format: 'cjs', keepNames: true });
+await buildParserAssets('.test-dist');
+await build({ entryPoints: ['src/analysis/index.ts'], outfile: '.test-dist/benchmark-analyzer.cjs', bundle: true, platform: 'node', target: 'node18', format: 'cjs', keepNames: true, plugins: [parserPlugin] });
 const { AnalyzerSession } = createRequire(import.meta.url)('../.test-dist/benchmark-analyzer.cjs');
 let temporary;
 async function put(relative, text) {

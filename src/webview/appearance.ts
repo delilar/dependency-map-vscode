@@ -1,6 +1,7 @@
 import type { FileRef, GraphNode, GraphSnapshot } from '../shared/model';
 import type { AnnotationGroup, RelationMark } from '../host/annotations';
 import { normalizeHexColor } from './group-draft';
+import { fileMetadata } from '../shared/file-metadata';
 export type { AnnotationGroup, RelationMark as AnnotationRelation } from '../host/annotations';
 
 export interface GraphAppearance {
@@ -8,7 +9,10 @@ export interface GraphAppearance {
   nodeBorders: Map<string, string>;
   edgeColors: Map<string, string>;
   folderColors: Map<string, string>;
+  folderMarks: Map<string, { marked: number; total: number }>;
 }
+
+export const FAMILY_COLORS = { code: '#4682b4', ui: '#44a08d', style: '#aa79bd', data: '#c29b40', config: '#b47c57', resource: '#7f96a8' };
 
 export const FORMAT_COLORS: Readonly<Record<string, string>> = {
   '.ts': '#3178c6', '.tsx': '#61dafb', '.js': '#e6c84f', '.jsx': '#e89d3c',
@@ -61,14 +65,18 @@ export function groupFilterIds(graph: Pick<GraphSnapshot, 'nodes' | 'relations'>
   for (const edge of graph.relations) if (marks.relationIds.has(edge.id)) { result.add(edge.sourceId); result.add(edge.targetId); }
   return result;
 }
-export function createGraphAppearance(graph: Pick<GraphSnapshot, 'nodes' | 'relations'>, group: AnnotationGroup | undefined, folders: readonly { id: string }[] = [], showGroupColors = true): GraphAppearance {
+export function createGraphAppearance(graph: Pick<GraphSnapshot, 'nodes' | 'relations'>, group: AnnotationGroup | undefined, folders: readonly { id: string }[] = [], showGroupColors = true, preset: 'family' | 'format' = 'format'): GraphAppearance {
   const appearance: GraphAppearance = {
-    nodeFills: new Map(graph.nodes.map(node => [node.id, formatFill(node)])),
-    nodeBorders: new Map(), edgeColors: new Map(), folderColors: new Map(folders.map(folder => [folder.id, folderTint(folder.id)]))
+    nodeFills: new Map(graph.nodes.map(node => [node.id, preset === 'family' && node.kind !== 'external' ? FAMILY_COLORS[node.family ?? fileMetadata(node.format, node.role).family!] : formatFill(node)])),
+    nodeBorders: new Map(), edgeColors: new Map(), folderColors: new Map(folders.map(folder => [folder.id, folderTint(folder.id)])), folderMarks: new Map()
   };
   const color = group ? normalizeHexColor(group.color) : undefined;
   if (!showGroupColors || !group || !color) return appearance;
   const marks = explicitMarks(graph, group);
+  for (const folder of folders) {
+    const members = graph.nodes.filter(node => node.file && (folder.id === `group:project:${node.projectId}` || folder.id === `group:folder:${node.file.rootId}/${node.file.path.includes('/') ? node.file.path.slice(0, node.file.path.lastIndexOf('/')) : '.'}`));
+    appearance.folderMarks.set(folder.id, { marked: members.filter(node => marks.fileIds.has(node.id)).length, total: members.length });
+  }
   for (const id of marks.fileIds) appearance.nodeBorders.set(id, color);
   for (const id of marks.relationIds) appearance.edgeColors.set(id, color);
   return appearance;

@@ -138,7 +138,7 @@ test('document overlays replace imports, restore disk on close, and missing file
 
 test('uses local package exports and Next conventions without executing project configuration', async () => {
   const data = fixture({
-    'package.json': '{"name":"web","dependencies":{"next":"*","@local/ui":"*"}}',
+    'package.json': '{"name":"web","dependencies":{"next":"16.0.0","@local/ui":"*"}}',
     'next.config.js': 'require("node:fs").writeFileSync("EXECUTED", "bad"); module.exports = {};',
     'packages/ui/package.json': '{"name":"@local/ui","exports":{".":"./src/index.ts"}}',
     'packages/ui/src/index.ts': 'export const Button = 1;',
@@ -419,7 +419,7 @@ test('workspace analysis exposes explainable roles in each project context and u
     'apps/components/package.json': '{"name":"@fixture/components"}',
     'apps/components/src/Feature.tsx': 'export default function Feature() {}',
     'apps/components/src/main.tsx': 'export {};',
-    'apps/web/package.json': '{"name":"@fixture/web","dependencies":{"next":"*"}}',
+    'apps/web/package.json': '{"name":"@fixture/web","dependencies":{"next":"16.0.0"}}',
     'apps/web/src/app/(auth)/page.tsx': 'export default function Page() {}',
     'apps/web/src/app/(auth)/layout.tsx': 'export default function Layout() {}',
     'apps/web/src/app/api/user/route.ts': 'export const GET = () => null;',

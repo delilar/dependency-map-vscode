@@ -48,14 +48,14 @@ function* resolutionSteps(tables: ExportTables, fileId: string, name: string, na
     if (++examined > 10000 || depth > 100) return { candidates: [], reasons: ['resolutionLimit'], incomplete: true, unsupported: false };
     const node = tables.nodes.get(file);
     if (!node?.file) return { candidates: [], reasons: ['missingModule'], incomplete: true, unsupported: false };
-    if (!/\.(?:[cm]?[jt]s|[jt]sx)$/i.test(node.format)) return { candidates: [], reasons: ['unsupportedFormat'], incomplete: true, unsupported: true };
     const coverage = tables.coverage.get(file);
-    const failures = coverage?.reasonCodes.filter(reason => ['parseDiagnostic', 'readFailed', 'textLimit', 'unsupportedCommonJs'].includes(reason)) ?? [];
+    const failures = coverage?.reasonCodes.filter(reason => ['readFailed', 'textLimit', 'unsupportedCommonJs', 'scriptParseDiagnostic', ...(coverage.symbols === undefined ? ['parseDiagnostic'] : [])].includes(reason)) ?? [];
     if (failures.length) return { candidates: [], reasons: failures, incomplete: true, unsupported: failures.includes('unsupportedCommonJs') };
+    if (coverage?.symbols === 'unavailable' || coverage?.symbols === undefined && !/\.(?:[cm]?[jt]s|[jt]sx)$/i.test(node.format)) return { candidates: [], reasons: ['unsupportedFormat'], incomplete: true, unsupported: true };
     const entries = tables.exports.get(file) ?? [];
     const explicit = entries.filter(entry => entry.name === exported && entry.kind !== 'star' && compatible(entry.namespace, requested));
     const active = explicit.length ? explicit : exported === 'default' ? [] : entries.filter(entry => entry.kind === 'star' && compatible(entry.namespace, requested));
-    const result: Part = { candidates: [], reasons: [], incomplete: false, unsupported: false };
+    const result: Part = { candidates: [], reasons: coverage?.symbols === 'limited' ? ['partialExportResolution'] : [], incomplete: coverage?.symbols === 'limited', unsupported: false };
     const nextSeen = new Set(seen).add(key);
     for (const entry of active) {
       yield {};

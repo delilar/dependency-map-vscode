@@ -1,6 +1,3 @@
-const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
-const indentedSassAvailable = nodeMajor > 20 || (nodeMajor === 20 && nodeMinor >= 19);
-
 export const formatCapabilities: Record<string, { mode: 'references' | 'keys-only' | 'node-only'; detail: string }> = {
   '.js': { mode: 'references', detail: 'TypeScript AST imports, exports, literal require/import, static assets and framework declarations' },
   '.jsx': { mode: 'references', detail: 'JavaScript plus literal JSX resource attributes' },
@@ -22,14 +19,15 @@ export const formatCapabilities: Record<string, { mode: 'references' | 'keys-onl
   '.toml': { mode: 'node-only', detail: 'Incoming references only' },
   '.xml': { mode: 'node-only', detail: 'Incoming references only' },
   '.csv': { mode: 'node-only', detail: 'Incoming references only' },
-  '.sass': { mode: indentedSassAvailable ? 'references' : 'node-only', detail: 'Official Sass parse-only AST: use/forward/import/url; requires Node 20.19+; computed paths stay unresolved; parser syntax subset is experimental' },
+  '.sass': { mode: 'references', detail: 'Bundled Sass parse-only AST: use/forward/import/url; computed paths stay unresolved; parser syntax subset is experimental' },
   '.less': { mode: 'references', detail: 'postcss-less parse-only imports (including options) and url(); variables/interpolation stay unresolved' },
   '.styl': { mode: 'references', detail: 'Stylus parse-only imports/require/url; unquoted paths may be inferred, bound variables stay unresolved; no evaluation' },
-  '.vue': { mode: 'node-only', detail: 'Component analyzer deferred' },
-  '.svelte': { mode: 'node-only', detail: 'Component analyzer deferred' },
-  '.astro': { mode: 'node-only', detail: 'Component analyzer deferred' },
-  '.md': { mode: 'node-only', detail: 'Incoming references only' },
-  '.mdx': { mode: 'node-only', detail: 'MDX internal-reference parser is not implemented' },
-  '.graphql': { mode: 'node-only', detail: 'GraphQL document imports are not implemented' },
-  '.gql': { mode: 'node-only', detail: 'GraphQL document imports are not implemented' }
+  '.vue': { mode: 'references', detail: 'Vue SFC scripts, templates, styles and component exports; preprocessors are not executed' },
+  '.svelte': { mode: 'references', detail: 'Svelte instance/module scripts, templates, styles and component exports' },
+  '.astro': { mode: 'references', detail: 'Astro frontmatter, components, scripts, styles and resources; local packaged WASM parser' },
+  '.md': { mode: 'references', detail: 'Markdown local links/images; code fences are documentation' },
+  '.mdx': { mode: 'references', detail: 'MDX ESM imports/exports, components, links and images; no evaluation or plugins' },
+  '.graphql': { mode: 'references', detail: 'GraphQL definitions and spreads; local fragment resolution requires explicit document collection' },
+  '.gql': { mode: 'references', detail: 'GraphQL definitions and spreads; local fragment resolution requires explicit document collection' },
+  '.stylus': { mode: 'references', detail: 'Stylus parse-only imports/require/url; computed expressions are not evaluated' }
 };

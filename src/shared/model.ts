@@ -4,20 +4,24 @@ export interface Position { line: number; character: number }
 export interface SourceRange { start: Position; end: Position }
 export type RelationKind = 'import' | 'reexport' | 'resource' | 'config' | 'framework' | 'environment';
 export interface Evidence { rule: string; range?: SourceRange }
-export interface Binding { imported: string; local?: string; typeOnly: boolean }
+export interface Binding { imported: string; local?: string; typeOnly: boolean; resolvedImported?: string }
 export interface GraphNode {
   id: string; label: string; kind: 'file' | 'external'; projectId: string;
   format: string; role?: string; roleReason?: string; file?: FileRef; packageName?: string; projectName?: string;
+  family?: 'code' | 'ui' | 'style' | 'data' | 'config' | 'resource';
+  languageId?: string;
 }
 export interface Relation {
   id: string; sourceId: string; targetId: string; kind: RelationKind;
   certainty: 'confirmed' | 'inferred'; specifier?: string;
   bindings: Binding[]; evidence: Evidence[];
+  provenanceIds?: string[];
+  symbolDependency?: boolean;
 }
 export interface UnresolvedReference {
   sourceId: string; reason: string; expression?: string; evidence: Evidence;
 }
-export interface Diagnostic { fileId?: string; message: string }
+export interface Diagnostic { fileId?: string; message: string; capability?: 'framework' }
 export interface DeclarationTarget { relationId: string; imported: string; file: FileRef; range: SourceRange }
 export interface GraphSnapshot {
   revision: number; nodes: GraphNode[]; relations: Relation[];
@@ -37,6 +41,8 @@ export interface ViewState {
   mode: 'file' | 'project'; focusId?: string; follow: boolean; depth: number;
   hideExternal: boolean; hideTests: boolean; groupBy: 'none' | 'folder' | 'project';
   collapseReexports: boolean; activeGroupId?: string; nodeDepths?: Record<string, number>;
+  queryScope?: import('./scope').ScopeSpec; presentationScope?: import('./scope').ScopeSpec;
+  colorPreset?: 'family' | 'format';
 }
 export function fileId(file: FileRef): string {
   return `file:${encodeURIComponent(file.rootId)}:${file.path.replace(/\\/g, '/')}`;

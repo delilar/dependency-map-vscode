@@ -63,6 +63,7 @@ try {
   browser = await chromium.launch(process.platform === 'win32' ? { channel: 'msedge', headless: true } : { headless: true });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } }); const errors = [];
   page.on('pageerror', error => errors.push(error.message)); await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.locator('.advanced-filters > summary').click();
   await page.getByRole('button', { name: 'B.ts', exact: true }).click();
   await page.getByRole('button', { name: 'Ещё исходящие', exact: true }).click();
   await page.waitForFunction(() => window.sent.some(m => m.type === 'branch' && m.direction === 'outgoing'));

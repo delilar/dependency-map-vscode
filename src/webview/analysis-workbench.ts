@@ -1,4 +1,5 @@
 import type { GraphNode, Relation } from '../shared/model';
+import { describeScopeSignature } from './scope-description';
 import type { HostState, UiMessage } from '../shared/protocol';
 import type { EvidencePath, QuerySpec, QueryResult, TaskContextData } from '../shared/query-model';
 import type { CanvasSelection } from './graph';
@@ -27,7 +28,10 @@ const indexLabels: Record<string, string> = { empty: 'Индекс отсутс�
 const reasonLabels: Record<string, string> = {
   depth: 'Достигнута глубина', maxNodes: 'Достигнут предел файлов', maxRelations: 'Достигнут предел связей', deadline: 'Достигнуто ограничение времени',
   missingSeed: 'Исходный файл недоступен', unresolved: 'Есть неразрешённые обращения', nodeOnly: 'Часть файлов индексируется без разбора содержимого',
-  buildMismatch: 'Сборки различаются', protocolMismatch: 'Версии протокола несовместимы', legacyWebview: 'Открыта старая вкладка карты'
+  buildMismatch: 'Сборки различаются', protocolMismatch: 'Версии протокола несовместимы', legacyWebview: 'Открыта старая вкладка карты',
+  frameworkScopeBoundary: 'Доказательство регистрации пересекает границу Q; ответ ограничен',
+  frameworkLimited: 'Часть правил фреймворка не разрешена', queryScopeChanged: 'Область Q изменилась',
+  parserFailed: 'Парсер недоступен или завершился ошибкой', scriptParseDiagnostic: 'Синтаксис script-блока разобран не полностью'
 };
 
 export function witnessSteps(witness: EvidencePath, nodes: ReadonlyMap<string, GraphNode>, relations: ReadonlyMap<string, Relation>): string {
@@ -58,6 +62,8 @@ export class AnalysisWorkbench {
   private readonly types = check('Включать type-only импорты', true);
   private readonly from = make('select');
   private readonly to = make('select');
+  private readonly pathMode = make('select');
+  private readonly pathInferred = check('Включать предполагаемые связи в путь', false);
   private readonly fileSearch = make('input');
   private readonly pathHint = make('p', 'Направление: от импортирующего к импортируемому. Подтверждённые import/reexport. До 10 000 файлов / 50 000 связей / 1500 мс.', 'hint');
   private readonly operation = make('p', '', 'analysis-status');
@@ -78,6 +84,7 @@ export class AnalysisWorkbench {
   private readonly repeatButton: HTMLButtonElement;
   private readonly cancelButton: HTMLButtonElement;
   private readonly impactButton: HTMLButtonElement;
+  private readonly availability = make('p', '', 'hint');
   private readonly pathButton: HTMLButtonElement;
   private readonly gitImpact: HTMLButtonElement;
   private resultKey = '';
@@ -93,12 +100,17 @@ export class AnalysisWorkbench {
     this.impactButton = button('Оценить влияние выбранного файла', () => {
       const node = this.selectedFile(); if (node) this.startImpact(node.id);
     });
-    body.append(control('Глубина влияния', this.impactDepth), this.inferred.label, this.types.label, this.impactButton,
+    body.append(this.availability, control('Глубина влияния', this.impactDepth), this.inferred.label, this.types.label, this.impactButton,
       make('p', 'Потенциальные потребители по статическим связям. Найденный тест — кандидат для проверки, а не измерение покрытия.', 'hint'));
     const path = make('details', '', 'path-query'); path.append(make('summary', 'Путь между файлами'));
     this.fileSearch.type = 'search'; this.fileSearch.placeholder = 'Найти файл для выбора концов пути'; this.fileSearch.addEventListener('input', () => this.updateFileChoices());
-    this.pathButton = button('Найти направленный путь', () => this.start({ kind: 'path', fromId: this.from.value, toId: this.to.value }));
+    for (const [value, title] of [['imports', 'Только импорты'], ['all', 'Все поддержанные типы связей']]) { const option = make('option', title); option.value = value; this.pathMode.append(option); }
+    this.pathMode.addEventListener('change', () => { this.pathHint.textContent = this.pathMode.value === 'all'
+      ? 'Направление: источник → зависимость. Все поддержанные типы; предполагаемые связи включаются отдельно. Пределы: 10 000 файлов / 50 000 связей / 1500 мс.'
+      : 'Направление: импортирующий → импортируемый. Только import/reexport; предполагаемые связи включаются отдельно. Пределы: 10 000 файлов / 50 000 связей / 1500 мс.'; });
+    this.pathButton = button('Найти направленный путь', () => this.start({ kind: 'path', fromId: this.from.value, toId: this.to.value, mode: this.pathMode.value as 'imports' | 'all', includeInferred: this.pathInferred.input.checked }));
     path.append(control('Поиск файлов пути', this.fileSearch), control('Откуда', this.from), control('Куда', this.to),
+      control('Типы связей пути', this.pathMode), this.pathInferred.label,
       button('Поменять направление', () => { const value = this.from.value; this.from.value = this.to.value; this.to.value = value; }), this.pathHint, this.pathButton);
     body.append(path); this.element.append(body);
 
@@ -135,6 +147,10 @@ export class AnalysisWorkbench {
   }
 
   private sendable(): boolean { return this.state?.analytics?.runtime.compatible === true && this.state.analytics.index.state === 'ready'; }
+  private unavailableReason(): string {
+    if (!this.state?.analytics?.runtime.compatible) return 'Анализ недоступен: версии карты и расширения не согласованы. Перезагрузите окно и откройте карту.';
+    return !this.sendable() ? 'Для анализа нужен актуальный индекс. Дождитесь завершения или нажмите «Пересчитать».' : '';
+  }
   private selectedFile(): GraphNode | undefined {
     return this.state?.graph.nodes.find(n => n.id === (this.selected.nodeIds[0] ?? this.state?.view.focusId) && n.file);
   }
@@ -147,7 +163,7 @@ export class AnalysisWorkbench {
   fileActions(node: GraphNode): HTMLElement {
     const actions = make('div', '', 'actions analytical-actions');
     if (!node.file) return actions;
-    const impact = button('Кто может зависеть от изменения', () => this.startImpact(node.id)); impact.disabled = !this.sendable();
+    const impact = button('Кто может зависеть от изменения', () => this.startImpact(node.id)); impact.disabled = !this.sendable(); impact.title = this.unavailableReason() || 'Найти прямых и косвенных потребителей выбранного файла';
     const from = button('Путь отсюда…', () => { this.element.open = true; (this.element.querySelector('.path-query') as HTMLDetailsElement).open = true; this.fileSearch.value = ''; this.updateFileChoices(); this.from.value = node.id; this.to.focus(); });
     actions.append(impact, from);
     const branches = this.state?.analytics?.branches ?? [];
@@ -174,13 +190,16 @@ export class AnalysisWorkbench {
     const actions = make('div', '', 'actions analytical-actions');
     for (const binding of edge.bindings) {
       const focus = button(`Фокус: ${binding.typeOnly ? 'type ' : ''}${binding.imported}${binding.local && binding.local !== binding.imported ? ` as ${binding.local}` : ''}`,
-        () => this.start({ kind: 'symbol', fileId: edge.targetId, exported: binding.imported, namespace: binding.typeOnly ? 'type' : 'value' }));
-      focus.disabled = !this.sendable(); actions.append(focus);
+        () => this.start({ kind: 'symbol', fileId: edge.targetId, exported: binding.resolvedImported ?? binding.imported, namespace: binding.typeOnly ? 'type' : 'value' }));
+      focus.disabled = !this.sendable(); focus.title = this.unavailableReason() || 'Найти поддержанные объявления и использования символа'; actions.append(focus);
     }
     return actions;
   }
   update(state: HostState, selected: CanvasSelection, visible: Set<string>): void {
     this.state = state; this.selected = selected; this.visible = visible;
+    this.availability.textContent = this.unavailableReason(); this.availability.hidden = this.sendable();
+    this.impactButton.title = this.unavailableReason() || (!this.selectedFile() ? 'Сначала выберите файл.' : 'Найти потенциальных потребителей выбранного файла');
+    this.pathButton.title = this.unavailableReason() || 'Найти направленный путь между выбранными файлами';
     const graphKey = JSON.stringify([state.graph.revision, state.analytics?.index.version.epoch, state.graph.nodes.length]);
     if (graphKey !== this.graphKey) { this.graphKey = graphKey; this.updateFileChoices(); }
     this.element.hidden = !state.analytics;
@@ -208,7 +227,7 @@ export class AnalysisWorkbench {
     const result = active.result?.operation === 'success' ? active.result : active.previousResult ?? active.result;
     const previous = !!result && result === active.previousResult;
     this.cancelButton.disabled = active.state !== 'running'; this.repeatButton.disabled = !this.sendable() || active.state === 'running';
-    const kinds = { impact: 'Влияние', path: 'Путь импортов', symbol: 'Символ', neighbourhood: 'Ветка' };
+    const kinds = { impact: 'Влияние', path: active.query.kind === 'path' && active.query.mode === 'all' ? 'Путь зависимостей' : 'Путь импортов', symbol: 'Символ', neighbourhood: 'Ветка' };
     const found = result?.nodeIds.length ?? 0, visible = result?.nodeIds.filter(id => this.visible.has(id)).length ?? 0;
     this.operation.textContent = `${kinds[active.query.kind]} · ${stateLabels[active.state]}${previous ? ' · показан предыдущий завершённый результат' : ''} · ${found} файлов в результате / ${visible} на карте / ${found - visible} скрыто. Карта закреплена.`;
     const key = JSON.stringify([active.requestId, active.state, result, [...this.visible], this.listLimit]);
@@ -220,6 +239,8 @@ export class AnalysisWorkbench {
     this.queryList.append(make('h3', outcomeLabels[result.outcome] ?? result.outcome),
       make('p', `${coverage[result.coverage]} · ${result.freshness === 'stale' ? 'результат устарел' : 'версия результата актуальна'} · ревизия ${result.graph.revision}`, 'hint'),
       make('p', `Просмотрено файлов: ${result.visitedNodes}, связей: ${result.examinedRelations}. Пределы: ${result.limits.maxNodes} / ${result.limits.maxRelations} / ${result.limits.deadlineMs} мс.`, 'hint'));
+    this.queryList.append(make('p', `Учитывалось при анализе: ${describeScopeSignature(result.queryScopeSignature, this.state!.graph.nodes)}`, 'hint'));
+    if (active.query.kind === 'path') this.queryList.append(make('p', `Политика: ${active.query.mode === 'all' ? 'все поддержанные типы' : 'import/reexport'}; ${active.query.includeInferred ? 'confirmed + inferred' : 'только confirmed'}.`, 'hint'));
     if (result.reasonCodes.length) this.queryList.append(make('p', result.reasonCodes.map(r => reasonLabels[r] ?? r).join(' · '), 'unresolved'));
     if (result.nodeIds.length > 500) this.queryList.append(make('p', 'Предел карты — 500 файлов. Полный результат остаётся в списке; показывайте нужные файлы или цепочки отдельно. Это не ограничение полноты запроса.', 'hint'));
     if (result.kind === 'symbol') {

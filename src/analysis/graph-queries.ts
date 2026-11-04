@@ -4,6 +4,7 @@ import type { EvidencePath, ExportResolution, QueryRequest, QueryResult, SymbolN
 import { querySeeds } from '../shared/query-model';
 import { GraphQueryIndex } from './graph-query-index';
 import { resolveExportAsync } from './export-resolution';
+import { scopedGraph, scopeSignature } from '../shared/scope';
 
 class Budget {
   readonly reasons = new Set<string>();
@@ -40,6 +41,7 @@ const pureType = (edge: Relation) => edge.bindings.length > 0 && edge.bindings.e
 const endpoint = (candidate: ExportResolution['candidates'][number]) => JSON.stringify([candidate.fileId, candidate.name, candidate.namespace]);
 
 export async function executeQuery(index: GraphQueryIndex, request: QueryRequest, isCancelled: () => boolean = () => false): Promise<QueryResult> {
+  if (request.scope) index = new GraphQueryIndex(scopedGraph(index.graph, request.scope));
   const budget = new Budget(request, isCancelled);
   const query = request.query;
   const seeds = [...new Set(querySeeds(query))];
@@ -98,7 +100,7 @@ export async function executeQuery(index: GraphQueryIndex, request: QueryRequest
         if (seen.has(key)) continue; seen.add(key);
         for (const edge of index.incoming.get(state.fileId) ?? []) {
           if (!await budget.check() || !budget.examine()) break;
-          if (!importEdge(edge)) continue;
+          if (!importEdge(edge) && !(edge.kind === 'framework' && edge.symbolDependency && edge.certainty === 'confirmed')) continue;
           const occurrences = index.occurrences.get(edge.id) ?? [];
           const relevant = occurrences.filter(row => (row.imported === state.name || row.imported === '*') && !(state.namespace === 'value' && row.typeOnly));
           if (!relevant.length) {
@@ -123,7 +125,7 @@ export async function executeQuery(index: GraphQueryIndex, request: QueryRequest
               queue.push({ fileId: edge.sourceId, name: exported, namespace: state.namespace,
                 nodeIds: [...state.nodeIds, edge.sourceId], relationIds: [...state.relationIds, edge.id] });
             }
-            if (edge.kind === 'import' && occurrence.imported === state.name) accepted = true;
+            if ((edge.kind === 'import' || edge.symbolDependency) && occurrence.imported === state.name) accepted = true;
           }
           if (!accepted || !include(edge.sourceId) || !include(edge.targetId)) continue;
           visibleRelations.add(edge.id);
@@ -132,7 +134,7 @@ export async function executeQuery(index: GraphQueryIndex, request: QueryRequest
       }
       if (resolution.status === 'ambiguous') scopeReasons.add('ambiguousExport');
       nodeIds = [...visibleNodes]; relationIds = [...visibleRelations];
-      for (const reason of index.reasons(budget.visited, true)) scopeReasons.add(reason);
+      for (const reason of index.reasons(budget.visited, true, true)) scopeReasons.add(reason);
     } else {
       const pathQuery = query.kind === 'path';
       const incoming = query.kind === 'impact' || query.kind === 'neighbourhood' && query.direction === 'incoming';
@@ -143,7 +145,8 @@ export async function executeQuery(index: GraphQueryIndex, request: QueryRequest
       const roots = pathQuery ? [query.fromId] : seeds;
       for (const id of roots) if (budget.visit(id)) queue.push({ id, depth: 0 });
       let found = pathQuery && query.fromId === query.toId;
-      const policy = (edge: Relation) => query.kind === 'impact' ? (query.includeInferred || edge.certainty === 'confirmed') && (query.includeTypes || !pureType(edge)) : pathQuery ? importEdge(edge) : true;
+      const policy = (edge: Relation) => query.kind === 'impact' ? (query.includeInferred || edge.certainty === 'confirmed') && (query.includeTypes || !pureType(edge))
+        : query.kind === 'path' ? (query.includeInferred || edge.certainty === 'confirmed') && (query.mode === 'all' || edge.kind === 'import' || edge.kind === 'reexport') : true;
       for (let cursor = 0; cursor < queue.length && !budget.stopped && !found; cursor++) {
         const item = queue[cursor], edges = (incoming ? index.incoming : index.outgoing).get(item.id) ?? [];
         for (const edge of edges) {
@@ -168,7 +171,7 @@ export async function executeQuery(index: GraphQueryIndex, request: QueryRequest
         while (predecessors.has(cursor)) { const step = predecessors.get(cursor)!; relations.unshift(step.relationId); nodes.unshift(step.previous); cursor = step.previous; }
         return { nodeId: id, nodeIds: nodes, relationIds: relations, depth: relations.length };
       };
-      for (const reason of index.reasons(budget.visited, incoming)) scopeReasons.add(reason);
+      for (const reason of index.reasons(budget.visited, incoming, query.kind !== 'path' || query.mode === 'all')) scopeReasons.add(reason);
       if (pathQuery) {
         if (found) { const path = witness(query.toId); witnesses.push(path); nodeIds = path.nodeIds; relationIds = path.relationIds; outcome = 'found'; }
       } else {
@@ -193,6 +196,7 @@ export async function executeQuery(index: GraphQueryIndex, request: QueryRequest
   const base = { type: 'queryResult' as const, requestId: request.requestId, graph: request.graph, operation,
     coverage: missing.length ? 'unknown' as const : coverage, freshness: 'current' as const, reasonCodes, limits: request.limits,
     visitedNodes: budget.visited.size, examinedRelations: budget.examined, nodeIds, relationIds, witnesses,
+    queryScopeSignature: scopeSignature(request.scope),
     ...(request.gitRevision === undefined ? {} : { gitRevision: request.gitRevision }) };
   if (query.kind === 'impact') return { ...base, kind: 'impact', outcome, directIds, indirectIds, testIds };
   if (query.kind === 'symbol') return { ...base, kind: 'symbol', outcome: resolution.status, resolution };

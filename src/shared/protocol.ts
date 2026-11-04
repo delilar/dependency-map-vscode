@@ -1,5 +1,6 @@
 import type { AnalysisOptions, GraphSnapshot, SourceOverlay, ViewState, WorkspaceRoot } from './model';
 import { isQuerySpec, type AnalyticsState, type BuildIdentity, type IndexVersion, type QueryRequest, type QueryResult, type QuerySpec, type TaskContextData } from './query-model';
+import { isScopeSpec } from './scope';
 
 export interface AnalyzeRequest { type: 'analyze'; generation: number; roots: WorkspaceRoot[]; options: AnalysisOptions; overlays: SourceOverlay[]; changedPaths?: string[]; graphVersion?: IndexVersion }
 export type WorkerRequest = AnalyzeRequest | QueryRequest | { type: 'cancelQuery'; requestId: string };
@@ -79,13 +80,15 @@ export function isSavedUiState(value: unknown): value is SavedUiState {
     && (canvas.positions === undefined || record(canvas.positions) && Object.keys(canvas.positions).length <= 10000 && Object.entries(canvas.positions).every(([id, position]) => bounded(id) && point(position)));
 }
 export function isViewState(value: unknown): value is ViewState {
-  if (!record(value) || Object.keys(value).some(key => !['mode', 'focusId', 'follow', 'depth', 'hideExternal', 'hideTests', 'groupBy', 'collapseReexports', 'activeGroupId', 'nodeDepths'].includes(key))) return false;
+  if (!record(value) || Object.keys(value).some(key => !['mode', 'focusId', 'follow', 'depth', 'hideExternal', 'hideTests', 'groupBy', 'collapseReexports', 'activeGroupId', 'nodeDepths', 'queryScope', 'presentationScope', 'colorPreset'].includes(key))) return false;
   return ['file', 'project'].includes(String(value.mode)) && typeof value.follow === 'boolean'
     && Number.isInteger(value.depth) && Number(value.depth) >= 1 && Number(value.depth) <= 20
     && typeof value.hideExternal === 'boolean' && typeof value.hideTests === 'boolean'
     && ['none', 'folder', 'project'].includes(String(value.groupBy)) && typeof value.collapseReexports === 'boolean'
     && (value.nodeDepths === undefined || record(value.nodeDepths) && Object.keys(value.nodeDepths).length <= 200 && Object.entries(value.nodeDepths).every(([id, depth]) => bounded(id) && id.startsWith('file:') && Number.isInteger(depth) && Number(depth) >= 1 && Number(depth) <= 20))
-    && (value.focusId === undefined || bounded(value.focusId)) && (value.activeGroupId === undefined || bounded(value.activeGroupId, 200));
+    && (value.focusId === undefined || bounded(value.focusId)) && (value.activeGroupId === undefined || bounded(value.activeGroupId, 200))
+    && (value.queryScope === undefined || isScopeSpec(value.queryScope)) && (value.presentationScope === undefined || isScopeSpec(value.presentationScope))
+    && (value.colorPreset === undefined || ['family', 'format'].includes(String(value.colorPreset)));
 }
 export function isUiMessage(value: unknown): value is UiMessage {
   if (!record(value)) return false;
