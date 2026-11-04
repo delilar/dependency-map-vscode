@@ -54,6 +54,10 @@ try {
   await page.getByRole('button', { name: 'A.vue', exact: true }).waitFor();
   await page.locator('.advanced-filters > summary').click();
   const visibleFiles = () => page.evaluate(() => document.querySelector('.graph')._cyreg.cy.nodes().filter(node => !node.data('group')).map(node => node.id()).sort());
+  const waitFiles = expected => page.waitForFunction(ids => {
+    const actual = document.querySelector('.graph')._cyreg.cy.nodes().filter(node => !node.data('group')).map(node => node.id()).sort();
+    return JSON.stringify(actual) === JSON.stringify(ids);
+  }, expected.slice().sort());
   const colors = () => page.evaluate(() => Object.fromEntries(document.querySelector('.graph')._cyreg.cy.nodes().filter(node => !node.data('group')).map(node => [node.id(), { fill: node.data('fill'), label: node.data('label'), border: node.data('border') }])));
   assert.equal((await visibleFiles()).length, 5);
   const family = await colors();
@@ -64,6 +68,7 @@ try {
   assert.equal(family[nodes[0].id].border, '#ef4444', 'Task mark remains separate from format fill');
   await page.getByLabel('Цветовая схема', { exact: true }).selectOption('format');
   await page.waitForFunction(() => window.harness.state.view.colorPreset === 'format');
+  await page.waitForFunction(({ id, fill }) => document.querySelector('.graph')._cyreg.cy.getElementById(id).data('fill') !== fill, { id: nodes[1].id, fill: family[nodes[1].id].fill });
   assert.notEqual((await colors())[nodes[1].id].fill, family[nodes[1].id].fill);
   await page.getByLabel('Цветовая схема', { exact: true }).selectOption('family');
   await page.getByText('Области вида V и анализа Q', { exact: true }).click();
@@ -73,12 +78,14 @@ try {
   await folders.fill('feature');
   await page.getByRole('button', { name: 'Применить область', exact: true }).click();
   await page.waitForFunction(() => window.harness.state.view.presentationScope?.folders[0].path === 'feature');
+  await waitFiles([nodes[0].id, nodes[2].id, nodes[3].id]);
   assert.deepEqual(await visibleFiles(), [nodes[0].id, nodes[2].id, nodes[3].id].sort(), 'V hides B without removing the path through it');
   assert.equal(await page.evaluate(() => window.harness.state.view.queryScope), undefined, 'V leaves the analytical scope unchanged');
   await page.getByLabel('Редактируемая область', { exact: true }).selectOption('queryScope');
   await folders.fill('feature');
   await page.getByRole('button', { name: 'Применить область', exact: true }).click();
   await page.waitForFunction(() => window.harness.state.view.queryScope?.folders[0].path === 'feature');
+  await waitFiles([nodes[0].id, nodes[3].id]);
   assert.deepEqual(await visibleFiles(), [nodes[0].id, nodes[3].id].sort(), 'Q blocks the outside intermediary rather than inventing A to C');
   const search = page.getByRole('searchbox', { name: 'Поиск по всему индексу', exact: true });
   await search.fill('B.ts');
@@ -98,11 +105,14 @@ try {
   await page.getByRole('button', { name: 'Применить область', exact: true }).click();
   await page.waitForFunction(() => window.harness.state.view.queryScope?.excludeRoles.includes('test'));
   await page.getByRole('button', { name: 'Сбросить показ (V)', exact: true }).click();
+  await waitFiles(nodes.slice(0, 4).map(node => node.id));
   assert(!(await visibleFiles()).includes(nodes[4].id));
   assert((await visibleFiles()).includes(nodes[1].id));
   await page.getByRole('button', { name: 'Сбросить анализ (Q)', exact: true }).click();
+  await waitFiles(nodes.slice(0, 5).map(node => node.id));
   assert((await visibleFiles()).includes(nodes[4].id), 'Reset restores the previous index without changing legacy test filtering');
   await page.getByLabel('Группировка', { exact: true }).selectOption('folder');
+  await page.waitForFunction(() => document.querySelector('.graph')._cyreg.cy.getElementById('group:folder:web/feature').length === 1);
   const folderMark = await page.evaluate(() => document.querySelector('.graph')._cyreg.cy.nodes().filter(node => node.data('group')).map(node => ({ id: node.id(), label: node.data('label'), border: node.data('border') })));
   const feature = folderMark.find(node => node.id === 'group:folder:web/feature');
   assert(feature?.label.includes('задача 2/3'), 'Folder task count includes all indexed members');
