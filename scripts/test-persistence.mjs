@@ -6,10 +6,12 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, cp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { realpathSync } from 'node:fs';
 
 const project = process.cwd();
 const rollback = process.argv.includes('--rollback');
-const temporary = await mkdtemp(path.join(os.tmpdir(), 'dependency-map-persistence-'));
+const temporaryBase = realpathSync.native(os.tmpdir());
+const temporary = await mkdtemp(path.join(temporaryBase, 'dependency-map-persistence-'));
 try {
   const executable = process.env.VSCODE_EXECUTABLE_PATH ?? await downloadAndUnzipVSCode(process.env.VSCODE_VERSION ?? '1.85.2');
   const extension = path.join(temporary, 'extension');
@@ -146,7 +148,7 @@ exports.activate=async context=>{
     console.log(phase === 'snapshot' ? 'Persisted local v2 rollback baseline captured before activating old code.' : phase === 'legacy' ? 'Archived 0.2.0 rollback passed: legacy view restored, new local keys and shared JSON preserved.' : `Normal VS Code persistence ${phase}: zoom=${result.zoom}, query, panel sizes, group colors, node depth and manual task point verified; restore pinned and shared JSON unchanged.`);
   }
 } finally {
-  const relative = path.relative(os.tmpdir(), temporary);
+  const relative = path.relative(temporaryBase, temporary);
   assert(relative && !relative.startsWith('..') && !path.isAbsolute(relative) && path.basename(temporary).startsWith('dependency-map-persistence-'));
   await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
 }

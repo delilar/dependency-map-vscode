@@ -178,6 +178,7 @@ try {
   await page.getByRole('button', { name: 'Сохранить заметку', exact: true }).click();
   assert(await page.evaluate(() => window.__messages.some(item => item.type === 'annotation' && item.action === 'note' && item.nodeIds.includes('n0') && item.note.includes('API'))), 'Selected file note should reach host');
   await page.getByLabel('Режим', { exact: true }).selectOption('file');
+  await page.locator('.focus-summary').filter({ hasText: 'В центре:' }).waitFor();
   await page.getByRole('button', { name: 'useProfile.ts', exact: true }).focus();
   await page.keyboard.press('Shift+F10');
   await page.getByRole('dialog', { name: 'Индивидуальная глубина узла', exact: true }).waitFor();
